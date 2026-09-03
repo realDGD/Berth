@@ -29,9 +29,10 @@ enum LocalPathComponentValidator {
     /// 拒绝:
     /// - 空字符串
     /// - "." 或 ".."
-    /// - 包含 "/" 或 "\\"
+    /// - 包含 "/" (路径分隔符)
     /// - 包含 NUL ("\0")
     /// - 包含 ASCII 控制字符
+    /// 提示: 在 Linux / Unix 与 macOS 本地文件系统中, "\" (反斜杠) 为合法文件名字符而非路径分隔符, 予以保留。
     static func validateComponent(_ component: String) throws {
         guard !component.isEmpty else {
             throw ValidationError.emptyComponent
@@ -39,7 +40,7 @@ enum LocalPathComponentValidator {
         if component == "." || component == ".." {
             throw ValidationError.pathTraversal(component: component)
         }
-        if component.contains("/") || component.contains("\\") || component.contains("\0") {
+        if component.contains("/") || component.contains("\0") {
             throw ValidationError.invalidCharacters(component: component)
         }
         if component.unicodeScalars.contains(where: { $0.value < 32 && $0.value != 9 }) {

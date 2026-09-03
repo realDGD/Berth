@@ -757,4 +757,18 @@ final class SFTPBrowserTests: XCTestCase {
         XCTAssertEqual(plan.files.first?.relativeComponents, ["safe.txt"])
         XCTAssertEqual(plan.directories.count, 2)
     }
+
+    func testSFTPDragRetentionPolicyCalculations() {
+        XCTAssertEqual(SFTPDragRetentionPolicy.retentionInterval(payloadBytes: nil), 1800)
+        XCTAssertEqual(SFTPDragRetentionPolicy.retentionInterval(payloadBytes: 0), 1800)
+
+        let hundredMiB: UInt64 = 100 * 1024 * 1024
+        XCTAssertEqual(SFTPDragRetentionPolicy.retentionInterval(payloadBytes: hundredMiB), 1800)
+
+        let tenGiB: UInt64 = 10 * 1024 * 1024 * 1024
+        XCTAssertEqual(SFTPDragRetentionPolicy.retentionInterval(payloadBytes: tenGiB), 5120)
+
+        let hundredGiB: UInt64 = 100 * 1024 * 1024 * 1024
+        XCTAssertEqual(SFTPDragRetentionPolicy.retentionInterval(payloadBytes: hundredGiB), 51200)
+    }
 }

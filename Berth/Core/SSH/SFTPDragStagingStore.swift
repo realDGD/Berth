@@ -22,7 +22,7 @@ public struct StagingMarkerMetadata: Codable, Sendable, Equatable {
     public var deliveredAt: Date?
     public let payloadName: String
     public let isDirectory: Bool
-    public var payloadBytes: Int64?
+    public var payloadBytes: UInt64?
 
     public init(
         schemaVersion: Int = 1,
@@ -32,7 +32,7 @@ public struct StagingMarkerMetadata: Codable, Sendable, Equatable {
         deliveredAt: Date? = nil,
         payloadName: String,
         isDirectory: Bool,
-        payloadBytes: Int64? = nil
+        payloadBytes: UInt64? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.id = id
@@ -67,11 +67,12 @@ public struct SweepResult: Sendable, Equatable {
 /// 管理 Finder 拖拽下载 staging 临时数据的完整所有权与跨进程生命周期。
 /// 保证:
 /// 1. 下载失败或取消时立即删除 staging root。
-/// 2. 交付成功后记录 deliveredAt 与传输字节数, 并在充分考虑慢速存储复制的宽限期后安全回收。
-/// 3. 进程异常退出或崩溃残留的 staging 在下次启动、新建拖拽或打开面板时安全 sweep。
-/// 4. 严苛的安全边界: 仅删除位于 staging 根目录下、以 Berth-Drag- 为前缀、
+/// 2. 交付成功后更新 deliveredAt 与真实 payloadBytes, 严格先持久化落盘再更新内存 active 状态。
+/// 3. 单文件与文件夹统一采用 SFTPDragRetentionPolicy 预估消费保留窗口, 避免大文件/目录被提前回收。
+/// 4. 进程异常退出或崩溃残留的 staging 在下次启动、新建拖拽或打开面板时安全 sweep。
+/// 5. 严苛的安全边界: 仅删除位于 staging 根目录下、以 Berth-Drag- 为前缀、
 ///    UUID 格式严格校验、且符合 stale 条件的实体, 绝不盲目 glob 或跨越符号链接。
-/// 5. 针对 89076ef 以前创建的 markerless legacy staging, 仅在严格满足直接子目录、
+/// 6. 针对 89076ef 以前创建的 markerless legacy staging, 仅在严格满足直接子目录、
 ///    严格 UUID 名称格式、非符号链接、未越界且超过安全 TTL (默认 24h) 时才安全回收。
 public actor SFTPDragStagingStore {
     public static let shared = SFTPDragStagingStore()
@@ -80,6 +81,7 @@ public actor SFTPDragStagingStore {
     public static let prefix = "Berth-Drag-"
 
     public typealias ProcessLivenessChecker = @Sendable (Int32) -> Bool
+    public typealias MarkerWriter = @Sendable (Data, URL) throws -> Void
 
     /// 严格遵循 POSIX 语义的进程存活检测器:
     /// kill(pid, 0) == 0: 进程存在
@@ -93,6 +95,10 @@ public actor SFTPDragStagingStore {
         return errno != ESRCH
     }
 
+    public static let defaultMarkerWriter: MarkerWriter = { data, url in
+        try data.write(to: url, options: .atomic)
+    }
+
     private let baseDirectory: URL
     private let fileManager = FileManager.default
     private var activeLeases: [UUID: SFTPDragStagingLease] = [:]
@@ -104,6 +110,7 @@ public actor SFTPDragStagingStore {
     public let legacyGracePeriod: TimeInterval
     public let minimumSweepInterval: TimeInterval
     private let processLivenessChecker: ProcessLivenessChecker
+    private let markerWriter: MarkerWriter
 
     public init(
         baseDirectory: URL = FileManager.default.temporaryDirectory,
@@ -112,7 +119,8 @@ public actor SFTPDragStagingStore {
         absoluteCeiling: TimeInterval = 24 * 3600,
         legacyGracePeriod: TimeInterval = 24 * 3600,
         minimumSweepInterval: TimeInterval = 60,
-        processLivenessChecker: @escaping ProcessLivenessChecker = SFTPDragStagingStore.defaultProcessLivenessChecker
+        processLivenessChecker: @escaping ProcessLivenessChecker = SFTPDragStagingStore.defaultProcessLivenessChecker,
+        markerWriter: @escaping MarkerWriter = SFTPDragStagingStore.defaultMarkerWriter
     ) {
         self.baseDirectory = baseDirectory
         self.deliveredGracePeriod = deliveredGracePeriod
@@ -121,6 +129,7 @@ public actor SFTPDragStagingStore {
         self.legacyGracePeriod = legacyGracePeriod
         self.minimumSweepInterval = minimumSweepInterval
         self.processLivenessChecker = processLivenessChecker
+        self.markerWriter = markerWriter
     }
 
     /// 创建一个全新的 staging lease。
@@ -154,36 +163,44 @@ public actor SFTPDragStagingStore {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(metadata)
-        try data.write(to: markerURL, options: .atomic)
+        try markerWriter(data, markerURL)
 
         let lease = SFTPDragStagingLease(id: id, rootURL: rootURL, payloadURL: payloadURL, createdAt: now)
         activeLeases[id] = lease
-        DebugLog.append("drag staging lease created id=\(id) name=\(named)")
+        DebugLog.append("drag staging lease created id=\(id) name=\(LogSanitizer.safeFilename(named))")
         return lease
     }
 
-    /// 标记 staging 已交付给 Finder。移除 active 状态, 并记录 delivered 时间戳及实际载荷大小。
-    public func markDelivered(_ lease: SFTPDragStagingLease, payloadBytes: Int64? = nil, now: Date = Date()) {
-        activeLeases.removeValue(forKey: lease.id)
+    /// 标记 staging 已交付给 Finder。
+    /// 严格事务语义: 先读取旧 marker, 更新 deliveredAt 与 payloadBytes 并持久化原子落盘。
+    /// 仅当磁盘持久化成功后, 才将内存中 activeLeases 移除。
+    /// 若写入失败, 抛出异常, 保持 active 保护状态由调用方安全清理, 绝不留下伪 delivered 态。
+    public func markDelivered(
+        _ lease: SFTPDragStagingLease,
+        payloadBytes: UInt64,
+        now: Date = Date()
+    ) throws {
         let markerURL = lease.rootURL.appendingPathComponent(Self.markerFilename, isDirectory: false)
-        guard fileManager.fileExists(atPath: markerURL.path) else { return }
-        do {
-            let data = try Data(contentsOf: markerURL)
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            var metadata = try decoder.decode(StagingMarkerMetadata.self, from: data)
-            metadata.deliveredAt = now
-            if let payloadBytes {
-                metadata.payloadBytes = payloadBytes
-            }
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            let updated = try encoder.encode(metadata)
-            try updated.write(to: markerURL, options: .atomic)
-            DebugLog.append("drag staging delivered id=\(lease.id) bytes=\(payloadBytes ?? 0)")
-        } catch {
-            DebugLog.append("drag staging delivered update failed id=\(lease.id) error=\(error)")
+        guard fileManager.fileExists(atPath: markerURL.path) else {
+            throw CocoaError(.fileNoSuchFile)
         }
+        let data = try Data(contentsOf: markerURL)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var metadata = try decoder.decode(StagingMarkerMetadata.self, from: data)
+        metadata.deliveredAt = now
+        metadata.payloadBytes = payloadBytes
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let updated = try encoder.encode(metadata)
+
+        // 注入式 marker writer 验证落盘
+        try markerWriter(updated, markerURL)
+
+        // 仅在落盘成功后更新内存状态
+        activeLeases.removeValue(forKey: lease.id)
+        DebugLog.append("drag staging delivered id=\(lease.id) bytes=\(payloadBytes)")
     }
 
     /// 下载失败或取消时立即删除 staging root。幂等安全。
@@ -257,13 +274,11 @@ public actor SFTPDragStagingStore {
 
                 let shouldReclaim: Bool
                 if let deliveredAt = metadata.deliveredAt {
-                    // 慢速目标动态宽限期: 假定至少 2 MB/s 写入, 大文件按体积延长保留
-                    let dynamicGrace = max(
-                        deliveredGracePeriod,
-                        TimeInterval(metadata.payloadBytes ?? 0) / (2 * 1024 * 1024)
-                    )
-                    shouldReclaim = now.timeIntervalSince(deliveredAt) >= dynamicGrace
+                    // 已投递给 Finder: 无论原进程是否存活, 均严格尊重单一来源 SFTPDragRetentionPolicy 窗口
+                    let retention = SFTPDragRetentionPolicy.retentionInterval(payloadBytes: metadata.payloadBytes)
+                    shouldReclaim = now.timeIntervalSince(deliveredAt) >= retention
                 } else {
+                    // 未成功投递 (下载中或中断): 区分崩溃残留与存活进程
                     let age = now.timeIntervalSince(metadata.createdAt)
                     if age >= absoluteCeiling {
                         shouldReclaim = true
@@ -348,7 +363,7 @@ public actor SFTPDragStagingStore {
             try fileManager.removeItem(at: rootURL)
             return true
         } catch {
-            DebugLog.append("drag staging remove failed url=\(rootURL.lastPathComponent) error=\(error)")
+            DebugLog.append("drag staging remove failed url=\(LogSanitizer.safeFilename(rootURL.lastPathComponent)) error=\(error)")
             return false
         }
     }
@@ -367,10 +382,10 @@ public actor SFTPDragStagingStore {
 
         do {
             try fileManager.removeItem(at: rootURL)
-            DebugLog.append("legacy drag staging reclaimed url=\(rootURL.lastPathComponent)")
+            DebugLog.append("legacy drag staging reclaimed url=\(LogSanitizer.safeFilename(rootURL.lastPathComponent))")
             return true
         } catch {
-            DebugLog.append("legacy drag staging remove failed url=\(rootURL.lastPathComponent) error=\(error)")
+            DebugLog.append("legacy drag staging remove failed url=\(LogSanitizer.safeFilename(rootURL.lastPathComponent)) error=\(error)")
             return false
         }
     }

@@ -49,19 +49,19 @@ enum SFTPDragProvider {
                     guard let browser else {
                         throw CocoaError(.fileNoSuchFile)
                     }
-                    try await browser.downloadForDrag(
+                    let result = try await browser.downloadForDrag(
                         entry,
                         remoteDirectory: remoteDirectory,
                         to: lease.payloadURL,
                         progress: progress
                     )
-                    let payloadBytes = entry.isDirectory ? nil : Int64(entry.size)
-                    await SFTPDragStagingStore.shared.markDelivered(lease, payloadBytes: payloadBytes)
+                    try await SFTPDragStagingStore.shared.markDelivered(lease, payloadBytes: result.copiedBytes)
                     completion(lease.payloadURL, false, nil)
                     // 文件表示的接收方可能在 completion 返回后才开始复制。
-                    // 按体积动态计算宽限期 (基线 30 分钟, 慢速介质按 2 MB/s 上浮),
+                    // 依据实际成功写入本地的 payloadBytes, 通过统一策略源 SFTPDragRetentionPolicy
+                    // 计算预估消费窗口 (基线 30 分钟, 慢速介质按 2 MiB/s 延长),
                     // 再清理由 Berth 创建的临时副本; 启动/新拖拽时也会兜底 sweep。
-                    let retentionSeconds = max(30 * 60, TimeInterval(entry.size) / (2 * 1024 * 1024))
+                    let retentionSeconds = SFTPDragRetentionPolicy.retentionInterval(payloadBytes: result.copiedBytes)
                     Task.detached {
                         try? await Task.sleep(for: .seconds(retentionSeconds))
                         await SFTPDragStagingStore.shared.discardIfDelivered(lease)
