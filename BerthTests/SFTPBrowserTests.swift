@@ -679,4 +679,55 @@ final class SFTPBrowserTests: XCTestCase {
         XCTAssertEqual(finalRequestCount, 0)
         XCTAssertEqual(finalHandleCount, 0)
     }
+
+    func testTransferConfigurationNormalizationAndBudgetSingleSource() async {
+        let customConfig = SFTPTransferConfiguration(
+            initialPipelineDepth: 4,
+            maxPipelineDepth: 16,
+            maxConcurrentFiles: 2,
+            maxConcurrentDirectories: 1,
+            requestLimit: 32,
+            handleLimit: 8
+        )
+        let budget = SFTPDownloadEngine.TransferBudget(configuration: customConfig)
+        XCTAssertEqual(budget.configuration.requestLimit, 32)
+        XCTAssertEqual(budget.configuration.handleLimit, 8)
+        XCTAssertEqual(budget.configuration.maxConcurrentFiles, 2)
+        XCTAssertEqual(budget.configuration.initialPipelineDepth, 4)
+        XCTAssertEqual(budget.configuration.maxPipelineDepth, 16)
+
+        // Verify normalization clamps non-positive values
+        let invalidConfig = SFTPTransferConfiguration(
+            initialPipelineDepth: 0,
+            maxPipelineDepth: -5,
+            maxConcurrentFiles: 0,
+            maxConcurrentDirectories: -1,
+            requestLimit: 0,
+            handleLimit: -2
+        )
+        let normalized = invalidConfig.normalized
+        XCTAssertEqual(normalized.initialPipelineDepth, 1)
+        XCTAssertEqual(normalized.maxPipelineDepth, 1)
+        XCTAssertEqual(normalized.maxConcurrentFiles, 1)
+        XCTAssertEqual(normalized.maxConcurrentDirectories, 1)
+        XCTAssertEqual(normalized.requestLimit, 1)
+        XCTAssertEqual(normalized.handleLimit, 1)
+    }
+
+    @MainActor
+    func testSFTPBrowserInitializesMatchingBudgetFromConfiguration() {
+        let config = SFTPTransferConfiguration(
+            initialPipelineDepth: 2,
+            maxPipelineDepth: 4,
+            maxConcurrentFiles: 4,
+            requestLimit: 16,
+            handleLimit: 4
+        )
+        let browser = SFTPBrowser(configuration: config) {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        XCTAssertEqual(browser.configuration.requestLimit, 16)
+        XCTAssertEqual(browser.configuration.handleLimit, 4)
+        XCTAssertEqual(browser.configuration.maxConcurrentFiles, 4)
+    }
 }

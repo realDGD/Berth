@@ -5,13 +5,16 @@ enum Persistence {
     /// BERTH_TRANSIENT_STORE=1 时使用内存库(自动化验收/测试),不污染用户数据
     static func makeContainer() -> ModelContainer {
         let schema = Schema([Host.self, HostGroup.self, SSHKeyRecord.self, PortForward.self, Snippet.self, Workspace.self, Trigger.self])
-        let transient = ProcessInfo.processInfo.environment["BERTH_TRANSIENT_STORE"] == "1"
+        let isTesting = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+        let transient = ProcessInfo.processInfo.environment["BERTH_TRANSIENT_STORE"] == "1" || isTesting
         let configuration: ModelConfiguration
         // CloudKit 私有库同步:主机/分组/转发/片段/模板/触发器 + 密钥元数据(公钥不是机密,
         // 记录同步后 keyID 跨设备仍可解析;私钥本体只在各设备 Keychain,永不上传)。
         // 镜像主机(ssh_config)是内存态,天然不参与同步。
         // 临时库(自动化/演示)与 BERTH_DISABLE_SYNC=1(调试逃生门)不接 CloudKit。
-        let syncDisabled = ProcessInfo.processInfo.environment["BERTH_DISABLE_SYNC"] == "1"
+        let syncDisabled = ProcessInfo.processInfo.environment["BERTH_DISABLE_SYNC"] == "1" || isTesting
         if transient {
             configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true, cloudKitDatabase: .none)
         } else if syncDisabled {

@@ -182,6 +182,7 @@ final class TerminalSession: Identifiable {
         sessionTask = Task {
             var disconnectReason: DisconnectReason
             var shellExited = false
+            let caughtError: Error?
             do {
                 if spec.isLocal {
                     try await runLocalSession()
@@ -201,27 +202,38 @@ final class TerminalSession: Identifiable {
                         try await runSession()
                     }
                 }
-                // 干净返回(收到 exit-status 0 / 干净 EOF)= shell 正常退出
-                shellExited = !userInitiatedDisconnect
-                disconnectReason = userInitiatedDisconnect ? .userInitiated : .remoteClosed
-            } catch is CancellationError {
-                disconnectReason = .userInitiated
+                caughtError = nil
             } catch {
-                if userInitiatedDisconnect {
-                    disconnectReason = .userInitiated
-                } else if everConnected, !Self.isConnectionStageError(error), Self.isCleanShellExit(error) {
-                    // 抛出的其实是通道 EOF/关闭(exit 与连接关闭竞速),视为 shell 退出。
-                    // 连接阶段的失败(认证被拒/私钥解析/交互认证取消)不可能是 shell 退出 ——
-                    // 它们的报错不含网络关键词,若不先排除会被误判成干净退出,
-                    // 自动重连一失败 pane 就无声关掉,诊断信息全丢
-                    shellExited = true
-                    disconnectReason = .remoteClosed
-                } else if spec.isLocal {
-                    // 本地会话只会抛自家的 SessionError(启动失败),不走 SSH 错误映射
-                    disconnectReason = .error((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
-                } else {
-                    disconnectReason = .error(SSHErrorMapper.friendlyMessage(for: error, hostname: spec.hostname, port: spec.port, authMethod: spec.authMethod))
-                }
+                caughtError = error
+            }
+
+            let disposition = SessionTerminationClassifier.classify(
+                error: caughtError,
+                everConnected: everConnected,
+                userInitiated: userInitiatedDisconnect,
+                isLocal: spec.isLocal,
+                hostname: spec.hostname,
+                port: spec.port,
+                authMethod: spec.authMethod
+            )
+
+            if let error = caughtError {
+                let category = SessionTerminationClassifier.categorize(error: error)
+                DebugLog.append("session terminated host=\(spec.hostname):\(spec.port) disposition=\(disposition) category=\(category.rawValue) everConnected=\(everConnected)")
+            } else {
+                DebugLog.append("session terminated host=\(spec.hostname):\(spec.port) disposition=\(disposition) everConnected=\(everConnected)")
+            }
+
+            switch disposition {
+            case .userInitiated:
+                shellExited = false
+                disconnectReason = .userInitiated
+            case .cleanShellExit:
+                shellExited = true
+                disconnectReason = .remoteClosed
+            case .transportFailure(let message):
+                shellExited = false
+                disconnectReason = .error(message)
             }
             state = .disconnected(disconnectReason)
             // 会话结束时质询弹窗必须收掉:服务器可能在用户找手机输 MFA 码时超时断开
@@ -250,29 +262,6 @@ final class TerminalSession: Identifiable {
                 maybeScheduleReconnect(after: disconnectReason)
             }
         }
-    }
-
-    /// 连接/认证阶段自家抛的错误类型 —— 这些永远不该被归类成「shell 正常退出」
-    private static func isConnectionStageError(_ error: Error) -> Bool {
-        error is SessionError
-            || error is SSHDialer.DialError
-            || error is PrivateKeyFormat.ConversionError
-            || error is KeyboardInteractiveAuthError
-            || error is HostKeyError
-            || error is AgentAuthError
-    }
-
-    /// 判断断开是否为 shell 正常退出(通道 EOF/关闭)而非网络异常(reset/timeout/refused…)
-    private static func isCleanShellExit(_ error: Error) -> Bool {
-        let s = String(describing: error).lowercased()
-        // 明确的网络异常关键词 → 不是干净退出,应保留横幅并重连
-        let networky = ["reset", "refused", "timed out", "timeout", "unreachable",
-                        "no route", "broken pipe", "not connected", "connection closed by",
-                        "handshake", "posix"]
-        if networky.contains(where: { s.contains($0) }) { return false }
-        // 其余(通道 EOF/关闭/退出码/未知)一律按 shell 退出处理 —— 已连上时通道关闭
-        // 绝大多数就是用户敲了 exit;真正的网络掉线基本都会命中上面的关键词
-        return true
     }
 
     func disconnect() {

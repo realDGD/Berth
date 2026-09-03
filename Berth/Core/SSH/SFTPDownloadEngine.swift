@@ -9,48 +9,7 @@ import Foundation
 /// callers do not accidentally create one unbounded pipeline per file.
 enum SFTPDownloadEngine {
 
-    struct Configuration: Sendable, Equatable {
-        /// Start small so a high-latency or conservative server is not overwhelmed during warm-up.
-        var initialPipelineDepth: Int = 2
-        /// Per-file cap.  The global request budget is the hard cap across every file and directory.
-        var maxPipelineDepth: Int = 8
-        var maxConcurrentFiles: Int = 8
-        var maxConcurrentDirectories: Int = 4
-        var maxOutstandingRequests: Int = 64
-        var maxOpenHandles: Int = 16
-        /// SFTP v3 has no portable transfer-size negotiation.  32 KiB is the interoperable fallback.
-        var fallbackChunkSize: Int = 32 * 1024
-
-        init(
-            initialPipelineDepth: Int = 2,
-            maxPipelineDepth: Int = 8,
-            maxConcurrentFiles: Int = 8,
-            maxConcurrentDirectories: Int = 4,
-            maxOutstandingRequests: Int = 64,
-            maxOpenHandles: Int = 16,
-            fallbackChunkSize: Int = 32 * 1024
-        ) {
-            self.initialPipelineDepth = initialPipelineDepth
-            self.maxPipelineDepth = maxPipelineDepth
-            self.maxConcurrentFiles = maxConcurrentFiles
-            self.maxConcurrentDirectories = maxConcurrentDirectories
-            self.maxOutstandingRequests = maxOutstandingRequests
-            self.maxOpenHandles = maxOpenHandles
-            self.fallbackChunkSize = fallbackChunkSize
-        }
-
-        fileprivate var normalized: Self {
-            var value = self
-            value.initialPipelineDepth = max(1, value.initialPipelineDepth)
-            value.maxPipelineDepth = max(value.initialPipelineDepth, value.maxPipelineDepth)
-            value.maxConcurrentFiles = max(1, value.maxConcurrentFiles)
-            value.maxConcurrentDirectories = max(1, value.maxConcurrentDirectories)
-            value.maxOutstandingRequests = max(1, value.maxOutstandingRequests)
-            value.maxOpenHandles = max(1, value.maxOpenHandles)
-            value.fallbackChunkSize = min(Int.UInt32MaxAsInt, max(1, value.fallbackChunkSize))
-            return value
-        }
-    }
+    typealias Configuration = SFTPTransferConfiguration
 
     struct File: Sendable, Equatable {
         let remotePath: String
@@ -298,12 +257,22 @@ enum SFTPDownloadEngine {
     /// through the engine; both semaphores are shared by directory listing, OPEN/FSTAT/READ/CLOSE,
     /// and all concurrently active files.
     actor TransferBudget {
+        nonisolated let configuration: SFTPTransferConfiguration
         private let requests: FIFOPermitSemaphore
         private let handles: FIFOPermitSemaphore
 
-        init(requestLimit: Int = 64, handleLimit: Int = 16) {
-            self.requests = FIFOPermitSemaphore(limit: requestLimit)
-            self.handles = FIFOPermitSemaphore(limit: handleLimit)
+        init(configuration: SFTPTransferConfiguration = .init()) {
+            let normalized = configuration.normalized
+            self.configuration = normalized
+            self.requests = FIFOPermitSemaphore(limit: normalized.requestLimit)
+            self.handles = FIFOPermitSemaphore(limit: normalized.handleLimit)
+        }
+
+        init(requestLimit: Int, handleLimit: Int = 16) {
+            self.init(configuration: SFTPTransferConfiguration(
+                requestLimit: requestLimit,
+                handleLimit: handleLimit
+            ))
         }
 
         func acquireRequest() async throws { try await requests.acquire() }
@@ -603,12 +572,13 @@ enum SFTPDownloadEngine {
         remoteRoot: String,
         localRoot: URL,
         sftp: SFTPClient,
-        budget: TransferBudget,
+        budget: TransferBudget? = nil,
         configuration: Configuration = .init(),
         onPlan: @escaping @Sendable (DirectoryPlan) async -> Void = { _ in },
         onProgress: @escaping @Sendable (ProgressUpdate) async -> Void = { _ in }
     ) async throws -> DirectoryPlan {
         let configuration = configuration.normalized
+        let budget = budget ?? TransferBudget(configuration: configuration)
         let plan = try await makeDirectoryDownloadPlan(
             remoteRoot: remoteRoot,
             budget: budget,
@@ -677,11 +647,12 @@ enum SFTPDownloadEngine {
         expectedSize: UInt64?,
         localURL: URL,
         sftp: SFTPClient,
-        budget: TransferBudget,
+        budget: TransferBudget? = nil,
         configuration: Configuration = .init(),
         onProgress: @escaping @Sendable (ProgressUpdate) async -> Void = { _ in }
     ) async throws -> UInt64 {
         let configuration = configuration.normalized
+        let budget = budget ?? TransferBudget(configuration: configuration)
         let reporter = ProgressAccumulator(
             totalBytes: expectedSize,
             unresolvedFileSizes: expectedSize == nil ? 1 : 0,
@@ -840,6 +811,9 @@ enum SFTPDownloadEngine {
                     try localHandle.seek(toOffset: offset)
                     try localHandle.write(contentsOf: data)
                 }
+                let activeHandles = await budget.currentHandleCount
+                let activeRequests = await budget.currentRequestCount
+                DebugLog.append("sftp file start name=\(localURL.lastPathComponent) size=\(size ?? 0) activeHandles=\(activeHandles) activeRequests=\(activeRequests)")
                 if let size {
                     copied = try await copyKnownSize(
                         expectedSize: size,
@@ -862,8 +836,10 @@ enum SFTPDownloadEngine {
                     )
                 }
                 try localHandle.close()
+                DebugLog.append("sftp file done name=\(localURL.lastPathComponent) copied=\(copied)")
             } catch {
                 try? localHandle.close()
+                DebugLog.append("sftp file failed name=\(localURL.lastPathComponent) error=\(error)")
                 throw error
             }
 
@@ -1001,6 +977,7 @@ enum SFTPDownloadEngine {
                     // Like OpenSSH, ramp up only after a complete response.  Short reads often
                     // indicate a server-side packet cap and should not increase pressure.
                     depth += 1
+                    DebugLog.append("sftp pipeline ramp depth=\(depth) max=\(maximumDepth) offset=\(result.range.offset)")
                 }
                 try schedule()
             }
