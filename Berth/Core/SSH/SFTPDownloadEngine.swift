@@ -46,6 +46,15 @@ enum SFTPDownloadEngine {
         /// partial sum must never be presented as a complete progress denominator.
         var totalBytes: UInt64? = 0
         var skippedSymlinks = 0
+        /// 传输阶段所有文件实际成功写入本地的累计字节数
+        var copiedBytes: UInt64 = 0
+    }
+
+    struct SFTPDownloadResult: Sendable, Equatable {
+        let copiedBytes: UInt64
+        init(copiedBytes: UInt64) {
+            self.copiedBytes = copiedBytes
+        }
     }
 
     struct ProgressUpdate: Sendable, Equatable {
@@ -645,7 +654,7 @@ enum SFTPDownloadEngine {
         do {
             try materializeDirectories(plan.directories, localRoot: localRoot)
 
-            try await downloadFiles(
+            let copiedBytes = try await downloadFiles(
                 plan.files,
                 localRoot: localRoot,
                 sftp: sftp,
@@ -654,7 +663,9 @@ enum SFTPDownloadEngine {
                 reporter: reporter
             )
             await reporter.finish()
-            return plan
+            var finalPlan = plan
+            finalPlan.copiedBytes = copiedBytes
+            return finalPlan
         } catch {
             await reporter.cancelDelivery()
             throw error
@@ -729,11 +740,12 @@ enum SFTPDownloadEngine {
         configuration: Configuration,
         budget: TransferBudget,
         reporter: ProgressAccumulator
-    ) async throws {
-        guard !files.isEmpty else { return }
-        try await withThrowingTaskGroup(of: UInt64.self) { group in
+    ) async throws -> UInt64 {
+        guard !files.isEmpty else { return 0 }
+        return try await withThrowingTaskGroup(of: UInt64.self) { group in
             var nextIndex = 0
             var active = 0
+            var totalCopied: UInt64 = 0
 
             while nextIndex < files.count || active > 0 {
                 while active < configuration.maxConcurrentFiles, nextIndex < files.count {
@@ -760,10 +772,13 @@ enum SFTPDownloadEngine {
                 }
 
                 if active > 0 {
-                    _ = try await group.next()
+                    if let bytes = try await group.next() {
+                        totalCopied = saturatingAdd(totalCopied, bytes)
+                    }
                     active -= 1
                 }
             }
+            return totalCopied
         }
     }
 
@@ -860,7 +875,7 @@ enum SFTPDownloadEngine {
                 }
                 let activeHandles = await budget.currentHandleCount
                 let activeRequests = await budget.currentRequestCount
-                DebugLog.append("sftp file start name=\(localURL.lastPathComponent) size=\(size ?? 0) activeHandles=\(activeHandles) activeRequests=\(activeRequests)")
+                DebugLog.append("sftp file start name=\(LogSanitizer.safeFilename(localURL.lastPathComponent)) size=\(size ?? 0) activeHandles=\(activeHandles) activeRequests=\(activeRequests)")
                 if let size {
                     copied = try await copyKnownSize(
                         expectedSize: size,
@@ -890,10 +905,10 @@ enum SFTPDownloadEngine {
                     }
                 }
                 try localHandle.close()
-                DebugLog.append("sftp file done name=\(localURL.lastPathComponent) copied=\(copied)")
+                DebugLog.append("sftp file done name=\(LogSanitizer.safeFilename(localURL.lastPathComponent)) copied=\(copied)")
             } catch {
                 try? localHandle.close()
-                DebugLog.append("sftp file failed name=\(localURL.lastPathComponent) error=\(error)")
+                DebugLog.append("sftp file failed name=\(LogSanitizer.safeFilename(localURL.lastPathComponent)) error=\(error)")
                 throw error
             }
 

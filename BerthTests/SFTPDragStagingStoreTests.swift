@@ -71,7 +71,7 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         try "hello staging".write(to: lease.payloadURL, atomically: true, encoding: .utf8)
 
         let deliveryTime = Date()
-        await store.markDelivered(lease, payloadBytes: 13, now: deliveryTime)
+        try await store.markDelivered(lease, payloadBytes: 13, now: deliveryTime)
 
         // Payload must still exist after delivery
         XCTAssertTrue(FileManager.default.fileExists(atPath: lease.payloadURL.path))
@@ -83,6 +83,35 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         let metadata = try decoder.decode(StagingMarkerMetadata.self, from: data)
         XCTAssertNotNil(metadata.deliveredAt)
         XCTAssertEqual(metadata.payloadBytes, 13)
+    }
+
+    func testMarkDeliveredAtomicWriteFailureKeepsActive() async throws {
+        final class MockWriter: @unchecked Sendable {
+            var fail = false
+        }
+        let mock = MockWriter()
+        let failingStore = SFTPDragStagingStore(
+            baseDirectory: tempDirectoryURL,
+            markerWriter: { data, url in
+                if mock.fail {
+                    throw CocoaError(.fileWriteNoPermission)
+                }
+                try data.write(to: url, options: .atomic)
+            }
+        )
+        let lease = try await failingStore.create(named: "fail_marker.txt", isDirectory: false)
+        mock.fail = true
+
+        do {
+            try await failingStore.markDelivered(lease, payloadBytes: 1024)
+            XCTFail("markDelivered must throw when marker write fails")
+        } catch {
+            // Expected
+        }
+
+        // Active lease must NOT be swept while failing/active
+        let sweepResult = try await failingStore.sweepStale(now: Date().addingTimeInterval(7200))
+        XCTAssertEqual(sweepResult.reclaimedCount, 0, "Active lease must remain protected")
     }
 
     func testActiveLeaseIsNeverSweptEvenIfOld() async throws {
@@ -98,7 +127,7 @@ final class SFTPDragStagingStoreTests: XCTestCase {
     func testDeliveredLeaseRetainedWithinGracePeriod() async throws {
         let t0 = Date()
         let lease = try await store.create(named: "delivered_recent.bin", isDirectory: false, now: t0)
-        await store.markDelivered(lease, payloadBytes: 1024, now: t0)
+        try await store.markDelivered(lease, payloadBytes: 1024, now: t0)
 
         // 10 minutes later (well within 30 min grace period)
         let sweepResult = try await store.sweepStale(now: t0.addingTimeInterval(600))
@@ -112,7 +141,7 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         let payloadData = Data(repeating: 0x41, count: 4096)
         try payloadData.write(to: lease.payloadURL)
 
-        await store.markDelivered(lease, payloadBytes: 4096, now: t0)
+        try await store.markDelivered(lease, payloadBytes: 4096, now: t0)
 
         // 35 minutes later (exceeds 30 min grace period)
         let sweepTime = t0.addingTimeInterval(2100)
@@ -120,6 +149,104 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         XCTAssertEqual(sweepResult.reclaimedCount, 1)
         XCTAssertGreaterThanOrEqual(sweepResult.reclaimedBytes, 4096)
         XCTAssertFalse(FileManager.default.fileExists(atPath: lease.rootURL.path))
+    }
+
+    // MARK: - Large Directory Retention Tests (P1)
+
+    func testLargeDirectoryRetentionScalesWithCopiedBytes() async throws {
+        // 100 GiB payload size
+        let hundredGiB: UInt64 = 100 * 1024 * 1024 * 1024
+        let expectedRetention = SFTPDragRetentionPolicy.retentionInterval(payloadBytes: hundredGiB)
+        // 100 GiB / 2 MiB/s = 51,200 seconds (~14.2 hours)
+        XCTAssertEqual(expectedRetention, 51200, accuracy: 1.0)
+
+        let t0 = Date()
+        let lease = try await store.create(named: "large_dir", isDirectory: true, now: t0)
+        try await store.markDelivered(lease, payloadBytes: hundredGiB, now: t0)
+
+        // 1 hour later: MUST NOT be swept
+        let oneHourLater = try await store.sweepStale(now: t0.addingTimeInterval(3600))
+        XCTAssertEqual(oneHourLater.reclaimedCount, 0, "100 GiB folder must not be swept after 1 hour")
+
+        // 10 hours later (36,000s): MUST NOT be swept
+        let tenHoursLater = try await store.sweepStale(now: t0.addingTimeInterval(36000))
+        XCTAssertEqual(tenHoursLater.reclaimedCount, 0, "100 GiB folder must not be swept after 10 hours")
+
+        // 15 hours later (54,000s > 51,200s): MUST be swept
+        let fifteenHoursLater = try await store.sweepStale(now: t0.addingTimeInterval(54000))
+        XCTAssertEqual(fifteenHoursLater.reclaimedCount, 1, "100 GiB folder should be swept after retention window expires")
+    }
+
+    func testActualCopiedBytesPersistedToMarker() async throws {
+        // Simulate directory with initial entry size 1 MiB but actual downloaded copiedBytes = 10 GiB
+        let tenGiB: UInt64 = 10 * 1024 * 1024 * 1024
+        let lease = try await store.create(named: "downloaded_tree", isDirectory: true)
+
+        try await store.markDelivered(lease, payloadBytes: tenGiB)
+
+        let markerURL = lease.rootURL.appendingPathComponent(SFTPDragStagingStore.markerFilename)
+        let data = try Data(contentsOf: markerURL)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let metadata = try decoder.decode(StagingMarkerMetadata.self, from: data)
+
+        XCTAssertEqual(metadata.payloadBytes, tenGiB, "Marker must accurately persist the actual downloaded copiedBytes")
+    }
+
+    func testDeliveredLeaseWithDeadPIDIsRetainedUntilRetentionExpires() async throws {
+        // Simulate a crash after delivery of a 100 GiB directory:
+        // DeliveredAt is recent, PID belongs to a dead process.
+        let customStore = SFTPDragStagingStore(
+            baseDirectory: tempDirectoryURL,
+            processLivenessChecker: { _ in false } // dead process
+        )
+
+        let hundredGiB: UInt64 = 100 * 1024 * 1024 * 1024
+        let leaseID = UUID()
+        let rootURL = tempDirectoryURL.appendingPathComponent("\(SFTPDragStagingStore.prefix)\(leaseID.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+
+        let t0 = Date()
+        let metadata = StagingMarkerMetadata(
+            schemaVersion: 1,
+            id: leaseID,
+            pid: 999999, // dead PID
+            createdAt: t0,
+            deliveredAt: t0,
+            payloadName: "crashed_after_delivery",
+            isDirectory: true,
+            payloadBytes: hundredGiB
+        )
+        let markerURL = rootURL.appendingPathComponent(SFTPDragStagingStore.markerFilename)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(metadata)
+        try data.write(to: markerURL)
+
+        // 2 hours after crash: Finder may still be copying to slow NAS. Dead PID must NOT trigger immediate deletion!
+        let sweepResult = try await customStore.sweepStale(now: t0.addingTimeInterval(7200))
+        XCTAssertEqual(sweepResult.reclaimedCount, 0, "Delivered staging must be retained within retention window even if owner PID is dead")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
+
+        // 15 hours later: Retention expired. Must now be swept.
+        let expiredSweep = try await customStore.sweepStale(now: t0.addingTimeInterval(54000))
+        XCTAssertEqual(expiredSweep.reclaimedCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: rootURL.path))
+    }
+
+    func testDeliveredLargeDirectoryRetainedAcrossRestart() async throws {
+        let hundredGiB: UInt64 = 100 * 1024 * 1024 * 1024
+        let t0 = Date()
+        let lease = try await store.create(named: "restart_test_dir", isDirectory: true, now: t0)
+        try await store.markDelivered(lease, payloadBytes: hundredGiB, now: t0)
+
+        // Simulate app restart by initializing a brand new SFTPDragStagingStore instance
+        let restartedStore = SFTPDragStagingStore(baseDirectory: tempDirectoryURL)
+
+        // Sweep 2 hours after restart: should retain
+        let sweepResult = try await restartedStore.sweepStale(now: t0.addingTimeInterval(7200))
+        XCTAssertEqual(sweepResult.reclaimedCount, 0, "Restarted store must recover retention from marker and retain delivered directory")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: lease.rootURL.path))
     }
 
     func testCrashInterruptedLeaseFromDeadPIDIsSwept() async throws {
@@ -290,7 +417,7 @@ final class SFTPDragStagingStoreTests: XCTestCase {
 
         // Create a stale lease
         let lease = try await store.create(named: "throttled.bin", isDirectory: false, now: now.addingTimeInterval(-7200))
-        await store.markDelivered(lease, now: now.addingTimeInterval(-7200))
+        try await store.markDelivered(lease, payloadBytes: 100, now: now.addingTimeInterval(-7200))
 
         // Sweep 10 seconds later with force: false (minimumSweepInterval is 60s)
         let throttledResult = try await store.sweepStale(now: now.addingTimeInterval(10), force: false)

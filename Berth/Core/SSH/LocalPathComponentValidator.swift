@@ -22,6 +22,14 @@ enum LocalPathComponentValidator {
         }
     }
 
+    /// 验证单个路径分量 (例如 entry.name)。
+    /// 拒绝:
+    /// - 空字符串
+    /// - "." 或 ".."
+    /// - 包含 "/" (路径分隔符)
+    /// - 包含 NUL ("\0")
+    /// - 包含 ASCII 控制字符
+    /// 提示: 在 Linux / Unix 与 macOS 本地文件系统中, "\" (反斜杠) 为合法文件名字符而非路径分隔符, 予以保留。
     static func validateComponent(_ component: String) throws {
         guard !component.isEmpty else {
             throw ValidationError.emptyComponent
