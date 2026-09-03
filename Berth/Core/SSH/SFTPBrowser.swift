@@ -134,15 +134,34 @@ final class SFTPBrowser {
     init(
         initialPath: String? = nil,
         configuration: SFTPTransferConfiguration = .init(),
-        transferBudget: SFTPDownloadEngine.TransferBudget? = nil,
         opener: @escaping () async throws -> SFTPClient
     ) {
         let normalized = configuration.normalized
         self.initialPath = initialPath
         self.configuration = normalized
-        self.transferBudget = transferBudget ?? SFTPDownloadEngine.TransferBudget(configuration: normalized)
+        self.transferBudget = SFTPDownloadEngine.TransferBudget(configuration: normalized)
         self.opener = opener
     }
+
+    #if DEBUG
+    /// 测试专用初始化方法: 强制校验注入的 transferBudget 与 configuration 必须绝对一致
+    init(
+        initialPath: String? = nil,
+        configuration: SFTPTransferConfiguration,
+        testBudget: SFTPDownloadEngine.TransferBudget,
+        opener: @escaping () async throws -> SFTPClient
+    ) {
+        let normalized = configuration.normalized
+        precondition(
+            testBudget.configuration == normalized,
+            "TransferBudget configuration must match SFTPBrowser configuration"
+        )
+        self.initialPath = initialPath
+        self.configuration = normalized
+        self.transferBudget = testBudget
+        self.opener = opener
+    }
+    #endif
 
     /// 打开 SFTP 并列出 home 目录。子通道打开可能被服务器无响应地挂住
     /// (sshd 未启用 SFTP 子系统 / MaxSessions 限制),15s 看门狗置失败态可重试。
@@ -309,6 +328,7 @@ final class SFTPBrowser {
         externalProgress: Progress?
     ) async throws {
         guard let sftp else { throw TransferError.sftpUnavailable }
+        try LocalPathComponentValidator.validateComponent(entry.name)
 
         let remotePath = join(remoteDirectory, entry.name)
         let transferID = beginTransfer(
@@ -616,7 +636,9 @@ final class SFTPBrowser {
 
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("berth-edit-\(UUID().uuidString)", isDirectory: true)
-        let localURL = dir.appendingPathComponent(entry.name)
+        guard let localURL = try? LocalPathComponentValidator.safeURL(in: dir, component: entry.name) else {
+            return nil
+        }
         editLocalURLs[remotePath] = localURL
 
         editing[remotePath] = .syncing

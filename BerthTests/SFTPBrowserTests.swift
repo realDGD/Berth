@@ -730,4 +730,31 @@ final class SFTPBrowserTests: XCTestCase {
         XCTAssertEqual(browser.configuration.handleLimit, 4)
         XCTAssertEqual(browser.configuration.maxConcurrentFiles, 4)
     }
+
+    func testMakeDirectoryDownloadPlanSkipsMaliciousFilenames() async throws {
+        let budget = SFTPDownloadEngine.TransferBudget(requestLimit: 8, handleLimit: 2)
+        let entries = [
+            SFTPDownloadEngine.DirectoryEntry(name: "safe.txt", kind: .file, size: 100, sizeIsKnown: true),
+            SFTPDownloadEngine.DirectoryEntry(name: "..", kind: .directory, size: 0, sizeIsKnown: false),
+            SFTPDownloadEngine.DirectoryEntry(name: "../escape.txt", kind: .file, size: 100, sizeIsKnown: true),
+            SFTPDownloadEngine.DirectoryEntry(name: "evil/nested.txt", kind: .file, size: 100, sizeIsKnown: true),
+            SFTPDownloadEngine.DirectoryEntry(name: "null\0byte.txt", kind: .file, size: 100, sizeIsKnown: true),
+            SFTPDownloadEngine.DirectoryEntry(name: "sub", kind: .directory, size: 0, sizeIsKnown: false)
+        ]
+
+        let plan = try await SFTPDownloadEngine.makeDirectoryDownloadPlan(
+            remoteRoot: "/remote/test",
+            budget: budget,
+            configuration: .init()
+        ) { path in
+            if path == "/remote/test" {
+                return entries
+            }
+            return []
+        }
+
+        XCTAssertEqual(plan.files.count, 1)
+        XCTAssertEqual(plan.files.first?.relativeComponents, ["safe.txt"])
+        XCTAssertEqual(plan.directories.count, 2)
+    }
 }

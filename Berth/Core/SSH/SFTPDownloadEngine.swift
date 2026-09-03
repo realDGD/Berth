@@ -540,6 +540,10 @@ enum SFTPDownloadEngine {
                 for entry in result.entries.sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending }) {
                     try Task.checkCancellation()
                     guard entry.name != ".", entry.name != ".." else { continue }
+                    guard (try? LocalPathComponentValidator.validateComponent(entry.name)) != nil else {
+                        DebugLog.append("sftp skip invalid path component=\(entry.name)")
+                        continue
+                    }
                     let childPath = appendRemotePath(result.pending.remotePath, entry.name)
                     let childComponents = result.pending.relativeComponents + [entry.name]
                     switch entry.kind {
@@ -610,7 +614,7 @@ enum SFTPDownloadEngine {
         await onPlan(plan)
         let reporter = ProgressAccumulator(
             totalBytes: plan.totalBytes,
-            unresolvedFileSizes: plan.totalBytes == nil ? plan.files.count : 0,
+            unresolvedFileSizes: plan.files.filter { $0.size == nil }.count,
             sink: onProgress
         )
         await reporter.emitInitial()
@@ -619,7 +623,7 @@ enum SFTPDownloadEngine {
             try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
             for components in plan.directories {
                 try Task.checkCancellation()
-                let destination = components.reduce(localRoot) { $0.appendingPathComponent($1, isDirectory: true) }
+                let destination = try LocalPathComponentValidator.safeURL(in: localRoot, components: components, isDirectory: true)
                 try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
             }
 
@@ -696,9 +700,11 @@ enum SFTPDownloadEngine {
                     let item = files[nextIndex]
                     nextIndex += 1
                     active += 1
-                    let localURL = item.relativeComponents.reduce(localRoot) {
-                        $0.appendingPathComponent($1, isDirectory: false)
-                    }
+                    let localURL = try LocalPathComponentValidator.safeURL(
+                        in: localRoot,
+                        components: item.relativeComponents,
+                        isDirectory: false
+                    )
                     group.addTask {
                         try await downloadOpenedFile(
                             remotePath: item.remotePath,
