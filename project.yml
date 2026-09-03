@@ -100,6 +100,7 @@ targets:
       - path: Berth/Core/SSH/ProxyConnector.swift
       - path: Berth/Core/SSH/SOCKS5.swift
       - path: Berth/Core/SSH/SFTPBrowser.swift
+      - path: Berth/Core/SSH/SFTPDownloadEngine.swift
       - path: Berth/Core/SSH/ServerInfo.swift
       - path: Berth/Core/Services/KeyStore.swift
       - path: Berth/Core/Services/HostReachability.swift

@@ -155,6 +155,8 @@ public final class SFTPClient: Sendable {
         var oldPath: String
 
         repeat {
+            // [Berth patch] cancellation is checked before every request in the realpath walk.
+            try Task.checkCancellation()
             oldPath = path
             guard case .name(let realpath) = try await sendRequest(.realpath(.init(requestId: self.allocateRequestId(), path: path))) else {
                 self.logger.warning("SFTP server returned bad response to open file request, this is a protocol error")
@@ -164,24 +166,22 @@ public final class SFTPClient: Sendable {
             path = realpath.path
         } while path != oldPath
         
+        // [Berth patch] do not create a directory handle after cancellation was requested.
+        try Task.checkCancellation()
         guard case .handle(let handle) = try await sendRequest(.opendir(.init(requestId: self.allocateRequestId(), handle: path))) else {
             self.logger.warning("SFTP server returned bad response to open file request, this is a protocol error")
             throw SFTPError.invalidResponse
         }
-        
-        var names = [SFTPMessage.Name]()
-        var response = try await sendRequest(
-            .readdir(
-                .init(
-                    requestId: self.allocateRequestId(),
-                    handle: handle.handle
-                )
-            )
-        )
-        
-        while case .name(let name) = response {
-            names.append(name)
-            response = try await sendRequest(
+
+        // OPENDIR consumes one server handle just like OPEN.  Close it on both success and every
+        // failure path (including cancellation), otherwise recursive scans leak one handle per
+        // directory and eventually hit the server's max-open-handles limit. [Berth patch]
+        var didClose = false
+        do {
+            var names = [SFTPMessage.Name]()
+            // [Berth patch] cancellation before the initial READDIR is caught below and closes.
+            try Task.checkCancellation()
+            var response = try await sendRequest(
                 .readdir(
                     .init(
                         requestId: self.allocateRequestId(),
@@ -189,9 +189,52 @@ public final class SFTPClient: Sendable {
                     )
                 )
             )
+
+            while case .name(let name) = response {
+                names.append(name)
+                // [Berth patch] an in-flight READDIR is allowed to finish, but no next request is
+                // sent after cancellation has become observable.
+                try Task.checkCancellation()
+                response = try await sendRequest(
+                    .readdir(
+                        .init(
+                            requestId: self.allocateRequestId(),
+                            handle: handle.handle
+                        )
+                    )
+                )
+            }
+
+            try await closeDirectoryHandle(handle.handle)
+            didClose = true
+            return names
+        } catch {
+            // [Berth patch] close is deliberately not cancellation-gated; sendRequest itself has
+            // no cancellation check, so the already-open handle is drained and closed here.
+            if !didClose {
+                try? await closeDirectoryHandleIgnoringCancellation(handle.handle)
+            }
+            throw error
         }
-        
-        return names
+    }
+
+    // [Berth patch] cleanup has no Task.checkCancellation and therefore still sends CLOSE after
+    // a caller's READDIR task is cancelled.  The caller awaits this function before returning.
+    private func closeDirectoryHandleIgnoringCancellation(_ handle: ByteBuffer) async throws {
+        try await closeDirectoryHandle(handle)
+    }
+
+    private func closeDirectoryHandle(_ handle: ByteBuffer) async throws {
+        let response = try await sendRequest(.closeFile(.init(
+            requestId: allocateRequestId(),
+            handle: handle
+        )))
+        guard case .status(let status) = response else {
+            throw SFTPError.invalidResponse
+        }
+        guard status.errorCode == .ok else {
+            throw SFTPError.errorStatus(status)
+        }
     }
     
     /// Get the attributes of a file on the SFTP server.
@@ -268,7 +311,9 @@ public final class SFTPClient: Sendable {
         }
             
         self.logger.debug("SFTP opened file \(filePath), file handle \(handle.handle.sftpHandleDebugDescription)")
-        return SFTPFile(client: self, path: filePath, handle: handle.handle)
+        // [Berth patch] SFTPFile only needs the server handle; path STAT was removed in favor
+        // of handle-scoped FSTAT for a consistent download snapshot.
+        return SFTPFile(client: self, handle: handle.handle)
     }
     
     /// Open and automatically close a file with the given closure.

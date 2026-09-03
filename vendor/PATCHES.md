@@ -155,3 +155,21 @@ Citadel 自带 `DiffieHellmanGroup14Sha1/Sha256` 与 `AES128CTR` 实现(Berth �
 ## 升级 Citadel/nio-ssh 时
 本地 vendor 已脱离 SPM 版本管理。若要升级,需重新 vendor 对应版本并重放上述 `[Berth patch]`
 改动(`grep -rn "\[Berth patch\]" vendor/` 可列出全部补丁点)。
+
+## 补丁: SFTP listDirectory 关闭 OPENDIR handle
+
+`SFTPClient.listDirectory(atPath:)` 原先在读取完目录后直接返回,没有发送
+`SSH_FXP_CLOSE`。递归下载/删除大量目录时会因此泄漏远端目录 handle,最终触发服务器的
+`max-open-handles` 限制。现已在成功、READDIR 失败和取消路径统一结构化等待 CLOSE；标记
+`[Berth patch]`，位置为 `Sources/Citadel/SFTP/Client/SFTPClient.swift`。
+
+## 补丁:SFTPFile 使用 FSTAT 并允许受控并发读取
+
+`SFTPFile.readAttributes()` 原先按路径发送 `STAT`，打开文件后若路径被替换会读到另一份
+文件的大小。现改为按已打开 handle 发送 `FSTAT`，供下载器在 READ 调度前取得该时点的
+size snapshot；移除不再使用的 path 字段，避免误导调用方继续走路径属性；同时以
+`NIOLockedValueBox` 保护 `isActive`，并标记 `SFTPFile` 为 `@unchecked Sendable`，使同一
+handle 的并发 READ 与结构化 CLOSE 具备明确的生命周期。关闭操作先在锁内原子地 claim
+handle，再发送一次 CLOSE，避免并发清理重复发送。上述每个 vendor 修改点均在源码带有
+`[Berth patch]` 标记，位置为 `Sources/Citadel/SFTP/Client/SFTPFile.swift` 及
+`Sources/Citadel/SFTP/Client/SFTPClient.swift` 的构造调用。
