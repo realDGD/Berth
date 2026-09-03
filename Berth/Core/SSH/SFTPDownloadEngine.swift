@@ -629,12 +629,7 @@ enum SFTPDownloadEngine {
         await reporter.emitInitial()
 
         do {
-            try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
-            for components in plan.directories {
-                try Task.checkCancellation()
-                let destination = try LocalPathComponentValidator.safeURL(in: localRoot, components: components, isDirectory: true)
-                try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-            }
+            try materializeDirectories(plan.directories, localRoot: localRoot)
 
             let copiedBytes = try await downloadFiles(
                 plan.files,
@@ -651,6 +646,29 @@ enum SFTPDownloadEngine {
         } catch {
             await reporter.cancelDelivery()
             throw error
+        }
+    }
+
+    /// 真实本地目录物化: 遍历 plan.directories 创建各级目录。
+    /// plan.directories[0] 为 [] (root sentinel, 代表 localRoot 本身), 已在此前由 FileManager 创建, 予以跳过。
+    /// 其余非空 components 通过 LocalPathComponentValidator 校验后拼接创建。
+    static func materializeDirectories(
+        _ directories: [[String]],
+        localRoot: URL
+    ) throws {
+        try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
+        for components in directories {
+            try Task.checkCancellation()
+            if components.isEmpty {
+                // root sentinel; localRoot 已经在此前创建, 跳过 validator 拼接
+                continue
+            }
+            let destination = try LocalPathComponentValidator.safeURL(
+                in: localRoot,
+                components: components,
+                isDirectory: true
+            )
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         }
     }
 
