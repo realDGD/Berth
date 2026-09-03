@@ -110,6 +110,22 @@ final class SFTPBrowser {
         var label: String
         /// 0...1;nil 表示不确定(扫描中/体积未知)
         var progress: Double?
+        var isCancelling: Bool
+        var canCancel: Bool
+
+        init(
+            id: UUID,
+            label: String,
+            progress: Double? = nil,
+            isCancelling: Bool = false,
+            canCancel: Bool = false
+        ) {
+            self.id = id
+            self.label = label
+            self.progress = progress
+            self.isCancelling = isCancelling
+            self.canCancel = canCancel
+        }
     }
 
     private(set) var state: State = .idle
@@ -272,10 +288,70 @@ final class SFTPBrowser {
     /// 本地上传的读取块大小(256KB):摊薄往返开销,同时避免整文件读入内存
     private static let uploadChunkSize = 256 * 1024
 
-    private func beginTransfer(_ label: String, progress: Double? = nil) -> UUID {
+    private var downloadTasks: [UUID: Task<SFTPDownloadEngine.SFTPDownloadResult, Error>] = [:]
+
+    typealias DownloadExecutor = @Sendable (
+        _ entry: Entry,
+        _ remotePath: String,
+        _ localURL: URL,
+        _ sftp: SFTPClient?,
+        _ budget: SFTPDownloadEngine.TransferBudget,
+        _ configuration: SFTPTransferConfiguration,
+        _ onPlan: @escaping @Sendable (SFTPDownloadEngine.DirectoryPlan) async -> Void,
+        _ onProgress: @escaping @Sendable (SFTPDownloadEngine.ProgressUpdate) async -> Void
+    ) async throws -> SFTPDownloadEngine.SFTPDownloadResult
+
+    static let defaultDownloadExecutor: DownloadExecutor = { entry, remotePath, localURL, sftp, budget, configuration, onPlan, onProgress in
+        guard let sftp else { throw TransferError.sftpUnavailable }
+        if entry.isDirectory {
+            let plan = try await SFTPDownloadEngine.downloadDirectory(
+                remoteRoot: remotePath,
+                localRoot: localURL,
+                sftp: sftp,
+                budget: budget,
+                configuration: configuration,
+                onPlan: onPlan,
+                onProgress: onProgress
+            )
+            return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: plan.copiedBytes)
+        } else {
+            let copiedBytes = try await SFTPDownloadEngine.downloadFile(
+                remotePath: remotePath,
+                expectedSize: entry.sizeIsKnown ? entry.size : nil,
+                localURL: localURL,
+                sftp: sftp,
+                budget: budget,
+                configuration: configuration,
+                onProgress: onProgress
+            )
+            return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: copiedBytes)
+        }
+    }
+
+    private var isCustomDownloadExecutor = false
+    var downloadExecutor: DownloadExecutor = SFTPBrowser.defaultDownloadExecutor {
+        didSet {
+            isCustomDownloadExecutor = true
+        }
+    }
+
+    private func beginTransfer(_ label: String, progress: Double? = nil, canCancel: Bool = false) -> UUID {
         let id = UUID()
-        transfers.append(ActiveTransfer(id: id, label: label, progress: progress))
+        transfers.append(ActiveTransfer(
+            id: id,
+            label: label,
+            progress: progress,
+            isCancelling: false,
+            canCancel: canCancel
+        ))
         return id
+    }
+
+    func cancelTransfer(_ id: UUID) {
+        guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
+        guard transfers[index].canCancel, !transfers[index].isCancelling else { return }
+        transfers[index].isCancelling = true
+        downloadTasks[id]?.cancel()
     }
 
     private func setTransfer(_ id: UUID, label: String) {
@@ -300,6 +376,10 @@ final class SFTPBrowser {
                 to: localURL,
                 externalProgress: nil
             )
+        } catch is CancellationError {
+            // 用户主动取消, 不改变 state 为 .failed
+        } catch where (error as? CocoaError)?.code == .userCancelled {
+            // 用户主动取消
         } catch {
             state = .failed(friendly(error))
         }
@@ -329,7 +409,9 @@ final class SFTPBrowser {
         to localURL: URL,
         externalProgress: Progress?
     ) async throws -> SFTPDownloadEngine.SFTPDownloadResult {
-        guard let sftp else { throw TransferError.sftpUnavailable }
+        if !isCustomDownloadExecutor {
+            guard sftp != nil else { throw TransferError.sftpUnavailable }
+        }
         try LocalPathComponentValidator.validateComponent(entry.name)
 
         let remotePath = join(remoteDirectory, entry.name)
@@ -337,9 +419,13 @@ final class SFTPBrowser {
             entry.isDirectory
                 ? String(localized: "扫描 \(entry.name)…")
                 : String(localized: "下载 \(entry.name)…"),
-            progress: !entry.isDirectory && entry.size > 0 ? 0 : nil
+            progress: !entry.isDirectory && entry.size > 0 ? 0 : nil,
+            canCancel: true
         )
-        defer { endTransfer(transferID) }
+        defer {
+            downloadTasks.removeValue(forKey: transferID)
+            endTransfer(transferID)
+        }
         let sink = SFTPDownloadProgressSink(progress: externalProgress) { [weak self] update in
             guard let self else { return }
             if let totalBytes = update.totalBytes, totalBytes > 0 {
@@ -357,37 +443,39 @@ final class SFTPBrowser {
             }
         }
 
-        let copiedBytes: UInt64
-        if entry.isDirectory {
-            let plan = try await SFTPDownloadEngine.downloadDirectory(
-                remoteRoot: remotePath,
-                localRoot: localURL,
-                sftp: sftp,
-                budget: transferBudget,
-                configuration: configuration,
-                onPlan: { [weak self] plan in
-                    guard let self else { return }
-                    await MainActor.run {
-                        self.setTransfer(transferID, label: plan.skippedSymlinks > 0
-                            ? String(localized: "下载 \(entry.name)…(跳过 \(plan.skippedSymlinks) 个符号链接)")
-                            : String(localized: "下载 \(entry.name)…"))
-                    }
-                },
-                onProgress: onProgress
-            )
-            copiedBytes = plan.copiedBytes
-        } else {
-            copiedBytes = try await SFTPDownloadEngine.downloadFile(
-                remotePath: remotePath,
-                expectedSize: entry.sizeIsKnown ? entry.size : nil,
-                localURL: localURL,
-                sftp: sftp,
-                budget: transferBudget,
-                configuration: configuration,
-                onProgress: onProgress
+        let onPlan: @Sendable (SFTPDownloadEngine.DirectoryPlan) async -> Void = { [weak self] plan in
+            guard let self else { return }
+            await MainActor.run {
+                self.setTransfer(transferID, label: plan.skippedSymlinks > 0
+                    ? String(localized: "下载 \(entry.name)…(跳过 \(plan.skippedSymlinks) 个符号链接)")
+                    : String(localized: "下载 \(entry.name)…"))
+            }
+        }
+
+        let transferTask = Task { [weak self] () -> SFTPDownloadEngine.SFTPDownloadResult in
+            guard let self else { throw CancellationError() }
+            return try await self.downloadExecutor(
+                entry,
+                remotePath,
+                localURL,
+                self.sftp,
+                self.transferBudget,
+                self.configuration,
+                onPlan,
+                onProgress
             )
         }
-        return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: copiedBytes)
+        downloadTasks[transferID] = transferTask
+
+        if Task.isCancelled {
+            transferTask.cancel()
+        }
+
+        return try await withTaskCancellationHandler {
+            try await transferTask.value
+        } onCancel: {
+            transferTask.cancel()
+        }
     }
 
     private static func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
@@ -822,6 +910,8 @@ final class SFTPBrowser {
         editTasks = [:]
         editLocalURLs = [:]
         editing = [:]
+        for task in downloadTasks.values { task.cancel() }
+        downloadTasks = [:]
         let client = sftp
         sftp = nil
         Task.detached { try? await client?.close() }

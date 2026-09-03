@@ -361,6 +361,23 @@ struct SFTPPanelView: View {
                                 .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(.secondary)
                         }
+                        if item.canCancel {
+                            if item.isCancelling {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Button {
+                                    browser?.cancelTransfer(item.id)
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 14, height: 14)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help(String(localized: "取消传输"))
+                            }
+                        }
                     }
                     if let p = item.progress {
                         ProgressView(value: p)
