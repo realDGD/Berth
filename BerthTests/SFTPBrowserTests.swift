@@ -855,7 +855,6 @@ final class SFTPBrowserTests: XCTestCase {
             }
         }
     }
-
     @MainActor
     func testDragDownloadRejectsUnsafeTopLevelNameBeforeSFTPAccess() async {
         let browser = SFTPBrowser {
@@ -887,5 +886,4 @@ final class SFTPBrowserTests: XCTestCase {
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
     }
-
 }

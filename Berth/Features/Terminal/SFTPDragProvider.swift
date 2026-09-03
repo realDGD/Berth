@@ -55,12 +55,15 @@ enum SFTPDragProvider {
                         to: lease.payloadURL,
                         progress: progress
                     )
-                    await SFTPDragStagingStore.shared.markDelivered(lease)
+                    let payloadBytes = entry.isDirectory ? nil : Int64(entry.size)
+                    await SFTPDragStagingStore.shared.markDelivered(lease, payloadBytes: payloadBytes)
                     completion(lease.payloadURL, false, nil)
-                    // 文件表示的接收方可能在 completion 返回后才开始复制。给 Finder 足够的
-                    // 取用宽限期, 再清理由 Berth 创建的临时副本; 启动/新拖拽时也会兜底 sweep。
+                    // 文件表示的接收方可能在 completion 返回后才开始复制。
+                    // 按体积动态计算宽限期 (基线 30 分钟, 慢速介质按 2 MB/s 上浮),
+                    // 再清理由 Berth 创建的临时副本; 启动/新拖拽时也会兜底 sweep。
+                    let retentionSeconds = max(30 * 60, TimeInterval(entry.size) / (2 * 1024 * 1024))
                     Task.detached {
-                        try? await Task.sleep(for: .seconds(30 * 60))
+                        try? await Task.sleep(for: .seconds(retentionSeconds))
                         await SFTPDragStagingStore.shared.discardIfDelivered(lease)
                     }
                 } catch {
