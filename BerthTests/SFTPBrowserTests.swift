@@ -730,4 +730,61 @@ final class SFTPBrowserTests: XCTestCase {
         XCTAssertEqual(browser.configuration.handleLimit, 4)
         XCTAssertEqual(browser.configuration.maxConcurrentFiles, 4)
     }
+    func testDirectoryMaterializationHandlesRootSentinelAndNestedDirectories() throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MaterializeTest-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        // Directories with root sentinel [] and nested subdirectories
+        let directories: [[String]] = [
+            [], // root sentinel for localRoot
+            ["empty"],
+            ["nested"],
+            ["nested", "child"]
+        ]
+
+        XCTAssertNoThrow(
+            try SFTPDownloadEngine.materializeDirectories(directories, localRoot: tempRoot),
+            "Root sentinel [] must be safely handled without throwing ValidationError.emptyComponent"
+        )
+
+        let fm = FileManager.default
+        XCTAssertTrue(fm.fileExists(atPath: tempRoot.path))
+        XCTAssertTrue(fm.fileExists(atPath: tempRoot.appendingPathComponent("empty").path))
+        XCTAssertTrue(fm.fileExists(atPath: tempRoot.appendingPathComponent("nested").path))
+        XCTAssertTrue(fm.fileExists(atPath: tempRoot.appendingPathComponent("nested/child").path))
+    }
+
+    func testDirectoryMaterializationFromPlanWithRootSentinelSucceeds() async throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PlanMaterializeTest-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let budget = SFTPDownloadEngine.TransferBudget(requestLimit: 8, handleLimit: 2)
+        let entries = [
+            SFTPDownloadEngine.DirectoryEntry(name: "subfolder", kind: .directory, size: 0, sizeIsKnown: false),
+            SFTPDownloadEngine.DirectoryEntry(name: "file.txt", kind: .file, size: 10, sizeIsKnown: true)
+        ]
+
+        let plan = try await SFTPDownloadEngine.makeDirectoryDownloadPlan(
+            remoteRoot: "/remote/dir",
+            budget: budget,
+            configuration: .init()
+        ) { path in
+            if path == "/remote/dir" {
+                return entries
+            }
+            return []
+        }
+
+        // plan.directories[0] is [] (root sentinel)
+        XCTAssertEqual(plan.directories.first, [])
+        XCTAssertEqual(plan.directories.count, 2) // [] and ["subfolder"]
+
+        XCTAssertNoThrow(
+            try SFTPDownloadEngine.materializeDirectories(plan.directories, localRoot: tempRoot)
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempRoot.appendingPathComponent("subfolder").path))
+    }
+
 }
