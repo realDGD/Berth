@@ -307,12 +307,13 @@ final class SFTPBrowser {
 
     /// Finder 拖出下载使用。拖拽开始时冻结 remoteDirectory,避免传输过程中切换目录后
     /// 同名文件被解析到新的当前位置。错误必须继续抛给 NSItemProvider,让 Finder 显示失败。
+    @discardableResult
     func downloadForDrag(
         _ entry: Entry,
         remoteDirectory: String,
         to localURL: URL,
         progress: Progress
-    ) async throws {
+    ) async throws -> SFTPDownloadEngine.SFTPDownloadResult {
         try await performDownload(
             entry,
             remoteDirectory: remoteDirectory,
@@ -321,12 +322,13 @@ final class SFTPBrowser {
         )
     }
 
+    @discardableResult
     private func performDownload(
         _ entry: Entry,
         remoteDirectory: String,
         to localURL: URL,
         externalProgress: Progress?
-    ) async throws {
+    ) async throws -> SFTPDownloadEngine.SFTPDownloadResult {
         // The top-level name is server-controlled too. Validate it before opening a handle or
         // touching the caller-provided local destination; recursive entries are validated by the
         // download engine while it builds the directory plan.
@@ -358,8 +360,9 @@ final class SFTPBrowser {
             }
         }
 
+        let copiedBytes: UInt64
         if entry.isDirectory {
-            _ = try await SFTPDownloadEngine.downloadDirectory(
+            let plan = try await SFTPDownloadEngine.downloadDirectory(
                 remoteRoot: remotePath,
                 localRoot: localURL,
                 sftp: sftp,
@@ -375,8 +378,9 @@ final class SFTPBrowser {
                 },
                 onProgress: onProgress
             )
+            copiedBytes = plan.copiedBytes
         } else {
-            _ = try await SFTPDownloadEngine.downloadFile(
+            copiedBytes = try await SFTPDownloadEngine.downloadFile(
                 remotePath: remotePath,
                 expectedSize: entry.sizeIsKnown ? entry.size : nil,
                 localURL: localURL,
@@ -386,6 +390,7 @@ final class SFTPBrowser {
                 onProgress: onProgress
             )
         }
+        return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: copiedBytes)
     }
 
     private static func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {

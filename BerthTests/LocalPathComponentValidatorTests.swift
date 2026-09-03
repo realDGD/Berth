@@ -54,4 +54,22 @@ final class LocalPathComponentValidatorTests: XCTestCase {
         XCTAssertFalse(LocalPathComponentValidator.isStrictlyContained(candidate: collision, within: root))
         XCTAssertFalse(LocalPathComponentValidator.isStrictlyContained(candidate: root, within: root))
     }
+
+    // MARK: - Log Sanitization Tests
+
+    func testLogSanitizerEscapesNewlinesAndControls() {
+        let malicious = "evil\n2026-09-03 ERROR fake injected log\r\tline"
+        let sanitized = LogSanitizer.sanitize(malicious)
+        XCTAssertFalse(sanitized.contains("\n"), "Must not contain raw newlines")
+        XCTAssertFalse(sanitized.contains("\r"), "Must not contain raw carriage returns")
+        XCTAssertTrue(sanitized.contains("\\n"), "Must escape newlines as \\n")
+        XCTAssertTrue(sanitized.contains("\\r"), "Must escape carriage returns as \\r")
+        XCTAssertTrue(sanitized.contains("\\t"), "Must escape tabs as \\t")
+
+        let filenameMalicious = "/some/remote/path/evil\nfile.txt"
+        let safeName = LogSanitizer.safeFilename(filenameMalicious)
+        XCTAssertFalse(safeName.contains("\n"))
+        XCTAssertFalse(safeName.contains("/some/remote/path"))
+        XCTAssertTrue(safeName.contains("evil\\nfile.txt"))
+    }
 }
