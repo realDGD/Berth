@@ -661,7 +661,7 @@ enum SFTPDownloadEngine {
 
     /// 真实本地目录物化: 遍历 plan.directories 创建各级目录。
     /// plan.directories[0] 为 [] (root sentinel, 代表 localRoot 本身), 已在此前由 FileManager 创建, 予以跳过。
-    /// 其余非空 components 按顺序拼接创建。
+    /// 其余非空 components 经过严格校验后按顺序拼接创建。
     static func materializeDirectories(
         _ directories: [[String]],
         localRoot: URL
