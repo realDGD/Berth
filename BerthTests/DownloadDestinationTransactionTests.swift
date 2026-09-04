@@ -286,4 +286,189 @@ final class DownloadDestinationTransactionTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
         XCTAssertEqual(simulatedError.code, .ENOSPC)
     }
+
+    // MARK: - 11. Replacement 失败恢复回归测试 (M-03 Recovery Hardening)
+
+    func testReplaceFailsBeforeOriginalMovedPreservesFinalAndPropagatesError() throws {
+        let finalURL = tempDirectoryURL.appendingPathComponent("replace_fail_early.bin")
+        let originalContent = "ORIGINAL CRITICAL DATA EARLY"
+        try originalContent.write(to: finalURL, atomically: true, encoding: .utf8)
+
+        struct SimulatedEarlyError: Error, Equatable {}
+
+        let tx = try DownloadDestinationTransaction.begin(
+            finalURL: finalURL,
+            isDirectory: false,
+            itemReplacer: { _, _ in
+                // Fail before touching finalURL
+                throw SimulatedEarlyError()
+            }
+        )
+        try "NEW CONTENT".write(to: tx.workingURL, atomically: true, encoding: .utf8)
+
+        var caughtError: Error?
+        do {
+            try tx.commit()
+            XCTFail("Commit must throw when replacement fails early")
+        } catch {
+            caughtError = error
+        }
+
+        XCTAssertTrue(caughtError is SimulatedEarlyError)
+        tx.discard()
+
+        // finalURL remains in place with original content
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finalURL.path))
+        let finalData = try String(contentsOf: finalURL, encoding: .utf8)
+        XCTAssertEqual(finalData, originalContent)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+    }
+
+    func testReplaceFailsAfterOriginalMovedRecoversFinalFromLocationKeyAndPropagatesError() throws {
+        let finalURL = tempDirectoryURL.appendingPathComponent("replace_fail_relocated.bin")
+        let originalContent = "ORIGINAL CRITICAL DATA RELOCATED"
+        try originalContent.write(to: finalURL, atomically: true, encoding: .utf8)
+
+        let recoveryURL = tempDirectoryURL.appendingPathComponent("foundation_recovery_staging.bin")
+        let simulatedReplaceError = NSError(
+            domain: NSCocoaErrorDomain,
+            code: CocoaError.fileWriteUnknown.rawValue,
+            userInfo: [DownloadDestinationTransaction.originalItemLocationKey: recoveryURL]
+        )
+
+        let tx = try DownloadDestinationTransaction.begin(
+            finalURL: finalURL,
+            isDirectory: false,
+            itemReplacer: { final, _ in
+                // Simulate Foundation moving original to recoveryURL, removing finalURL, then failing
+                try FileManager.default.moveItem(at: final, to: recoveryURL)
+                throw simulatedReplaceError
+            }
+        )
+        try "NEW CONTENT".write(to: tx.workingURL, atomically: true, encoding: .utf8)
+
+        var caughtError: Error?
+        do {
+            try tx.commit()
+            XCTFail("Commit must throw when replacement fails after relocation")
+        } catch {
+            caughtError = error
+        }
+
+        // Original replace error must be propagated to caller
+        XCTAssertEqual((caughtError as? NSError)?.domain, NSCocoaErrorDomain)
+        XCTAssertEqual((caughtError as? NSError)?.code, CocoaError.fileWriteUnknown.rawValue)
+
+        tx.discard()
+
+        // finalURL must have been successfully recovered from recoveryURL
+        XCTAssertFalse(FileManager.default.fileExists(atPath: recoveryURL.path), "Recovery staging must have been moved back")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finalURL.path))
+        let finalData = try String(contentsOf: finalURL, encoding: .utf8)
+        XCTAssertEqual(finalData, originalContent, "Original content must be fully restored")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+    }
+
+    func testReplaceFailsAndRecoveryFailsThrowsRecoveryFailedError() throws {
+        let subFolder = tempDirectoryURL.appendingPathComponent("recovery_fail_sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: subFolder, withIntermediateDirectories: true)
+
+        let finalURL = subFolder.appendingPathComponent("replace_fail_recovery_fails.bin")
+        let originalContent = "ORIGINAL DATA STUCK IN RECOVERY"
+        try originalContent.write(to: finalURL, atomically: true, encoding: .utf8)
+
+        let recoveryURL = tempDirectoryURL.appendingPathComponent("foundation_recovery_stuck.bin")
+        let simulatedReplaceError = NSError(
+            domain: "CustomReplacementErrorDomain",
+            code: 42,
+            userInfo: [DownloadDestinationTransaction.originalItemLocationKey: recoveryURL]
+        )
+
+        let tx = try DownloadDestinationTransaction.begin(
+            finalURL: finalURL,
+            isDirectory: false,
+            itemReplacer: { final, _ in
+                // Move original to recoveryURL
+                try FileManager.default.moveItem(at: final, to: recoveryURL)
+                // Make parent directory read-only so restoration moveItem fails with permission denied
+                try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: subFolder.path)
+                throw simulatedReplaceError
+            }
+        )
+        try "NEW CONTENT".write(to: tx.workingURL, atomically: true, encoding: .utf8)
+
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: subFolder.path)
+        }
+
+        do {
+            try tx.commit()
+            XCTFail("Commit must throw recoveryFailed when recovery cannot be completed")
+        } catch let error as DownloadDestinationTransaction.TransactionError {
+            switch error {
+            case .recoveryFailed(let originalError, let recoveryError, let recURL, let finURL):
+                XCTAssertEqual(originalError.domain, "CustomReplacementErrorDomain")
+                XCTAssertEqual(originalError.code, 42)
+                XCTAssertEqual(recURL.path, recoveryURL.path)
+                XCTAssertEqual(finURL.path, finalURL.path)
+                XCTAssertNotNil(recoveryError)
+            default:
+                XCTFail("Expected recoveryFailed error, got \(error)")
+            }
+        } catch {
+            XCTFail("Expected TransactionError, got \(error)")
+        }
+
+        // Original file must still be present at recoveryURL for user data preservation
+        XCTAssertTrue(FileManager.default.fileExists(atPath: recoveryURL.path))
+        let stuckData = try String(contentsOf: recoveryURL, encoding: .utf8)
+        XCTAssertEqual(stuckData, originalContent)
+
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: subFolder.path)
+        tx.discard()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+    }
+
+    func testReplaceFailsAndOriginalMissingWithoutRecoveryLocationKeyThrowsRecoveryFailedError() throws {
+        let finalURL = tempDirectoryURL.appendingPathComponent("replace_fail_no_key.bin")
+        try "ORIGINAL DATA".write(to: finalURL, atomically: true, encoding: .utf8)
+
+        let simulatedReplaceError = NSError(
+            domain: "CustomReplacementErrorDomain",
+            code: 99,
+            userInfo: [:] // Missing recovery key
+        )
+
+        let tx = try DownloadDestinationTransaction.begin(
+            finalURL: finalURL,
+            isDirectory: false,
+            itemReplacer: { final, _ in
+                // Remove final without leaving recovery key
+                try FileManager.default.removeItem(at: final)
+                throw simulatedReplaceError
+            }
+        )
+        try "NEW CONTENT".write(to: tx.workingURL, atomically: true, encoding: .utf8)
+
+        do {
+            try tx.commit()
+            XCTFail("Commit must throw recoveryFailed when final is missing and no recovery key is provided")
+        } catch let error as DownloadDestinationTransaction.TransactionError {
+            switch error {
+            case .recoveryFailed(let originalError, let recoveryError, let recURL, let finURL):
+                XCTAssertEqual(originalError.domain, "CustomReplacementErrorDomain")
+                XCTAssertEqual(originalError.code, 99)
+                XCTAssertEqual(recURL.path, finalURL.path)
+                XCTAssertEqual(finURL.path, finalURL.path)
+                XCTAssertEqual(recoveryError.domain, NSCocoaErrorDomain)
+            default:
+                XCTFail("Expected recoveryFailed error, got \(error)")
+            }
+        } catch {
+            XCTFail("Expected TransactionError, got \(error)")
+        }
+
+        tx.discard()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+    }
 }
