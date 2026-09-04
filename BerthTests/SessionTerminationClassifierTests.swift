@@ -159,4 +159,113 @@ final class SessionTerminationClassifierTests: XCTestCase {
         }
         XCTAssertEqual(SessionTerminationClassifier.categorize(error: err), .localShellExited)
     }
+
+    // MARK: - PTY Cleanup Error Preservation Tests (P1-2)
+
+    private func simulatePTYExecution(
+        perform: () async throws -> Void,
+        cleanupClose: () async throws -> Void
+    ) async throws {
+        do {
+            try await perform()
+            do {
+                try await cleanupClose()
+            } catch ChannelError.alreadyClosed, ChannelError.eof {
+                // Remote already cleanly closed; benign on clean exit
+            }
+        } catch {
+            try? await cleanupClose()
+            throw error
+        }
+    }
+
+    func testPTYPerformSuccessAndCleanupSuccessYieldsCleanExit() async {
+        do {
+            try await simulatePTYExecution(
+                perform: { /* clean exit */ },
+                cleanupClose: { /* channel.close() succeeds */ }
+            )
+            let disposition = SessionTerminationClassifier.classify(
+                error: nil,
+                everConnected: true,
+                userInitiated: false
+            )
+            XCTAssertEqual(disposition, .cleanShellExit)
+        } catch {
+            XCTFail("Expected clean exit, but caught \(error)")
+        }
+    }
+
+    func testPTYPerformSuccessAndCleanupAlreadyClosedYieldsCleanExit() async {
+        do {
+            try await simulatePTYExecution(
+                perform: { /* clean exit */ },
+                cleanupClose: { throw ChannelError.alreadyClosed }
+            )
+            // ChannelError.alreadyClosed absorbed during cleanup; error is nil
+            let disposition = SessionTerminationClassifier.classify(
+                error: nil,
+                everConnected: true,
+                userInitiated: false
+            )
+            XCTAssertEqual(disposition, .cleanShellExit)
+        } catch {
+            XCTFail("Expected clean exit, but cleanup alreadyClosed threw: \(error)")
+        }
+    }
+
+    func testPTYPerformThrowsTcpShutdownAndCleanupAlreadyClosedPreservesTcpShutdown() async {
+        struct MockTCPShutdownError: Error, CustomStringConvertible, Equatable {
+            var description: String { "NIOSSHError.tcpShutdown" }
+        }
+
+        var caught: Error?
+        do {
+            try await simulatePTYExecution(
+                perform: { throw MockTCPShutdownError() },
+                cleanupClose: { throw ChannelError.alreadyClosed }
+            )
+            XCTFail("Should have thrown error")
+        } catch {
+            caught = error
+        }
+
+        XCTAssertTrue(caught is MockTCPShutdownError, "Must preserve original tcpShutdown error and NOT replace with alreadyClosed")
+        let disposition = SessionTerminationClassifier.classify(
+            error: caught,
+            everConnected: true,
+            userInitiated: false
+        )
+        guard case .transportFailure = disposition else {
+            XCTFail("Expected transportFailure, got \(disposition)")
+            return
+        }
+    }
+
+    func testPTYPerformThrowsCustomErrorAAndCleanupThrowsErrorBPreservesErrorA() async {
+        struct CustomErrorA: Error, Equatable {}
+        struct CustomErrorB: Error, Equatable {}
+
+        var caught: Error?
+        do {
+            try await simulatePTYExecution(
+                perform: { throw CustomErrorA() },
+                cleanupClose: { throw CustomErrorB() }
+            )
+            XCTFail("Should have thrown error")
+        } catch {
+            caught = error
+        }
+
+        XCTAssertTrue(caught is CustomErrorA, "Must preserve business error A and ignore cleanup error B")
+        let disposition = SessionTerminationClassifier.classify(
+            error: caught,
+            everConnected: true,
+            userInitiated: false
+        )
+        guard case .transportFailure = disposition else {
+            XCTFail("Expected transportFailure, got \(disposition)")
+            return
+        }
+    }
 }

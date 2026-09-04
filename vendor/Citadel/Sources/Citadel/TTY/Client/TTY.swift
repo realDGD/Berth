@@ -357,16 +357,17 @@ extension SSHClient {
             mode: .pty(request)
         )
 
-        func close() async throws {
-            try await channel.close()
-        }
-
         do {
             let inbound = TTYOutput(sequence: output)
             try await perform(inbound, TTYStdinWriter(channel: channel))
-            try await close()
+            do {
+                try await channel.close()
+            } catch ChannelError.alreadyClosed, ChannelError.eof {
+                // [Berth patch] Remote already cleanly closed the channel; benign on clean exit
+            }
         } catch {
-            try await close()
+            // [Berth patch] Cleanup is best effort; do not let cleanup error override original error
+            try? await channel.close()
             throw error
         }
     }
@@ -406,16 +407,17 @@ extension SSHClient {
             mode: .tty(command: nil)
         )
 
-        func close() async throws {
-            try await channel.close()
-        }
-
         do {
             let inbound = TTYOutput(sequence: output)
             try await perform(inbound, TTYStdinWriter(channel: channel))
-            try await close()
+            do {
+                try await channel.close()
+            } catch ChannelError.alreadyClosed, ChannelError.eof {
+                // [Berth patch] Remote already cleanly closed the channel; benign on clean exit
+            }
         } catch {
-            try await close()
+            // [Berth patch] Cleanup is best effort; do not let cleanup error override original error
+            try? await channel.close()
             throw error
         }
     }

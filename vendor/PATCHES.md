@@ -173,3 +173,13 @@ handle 的并发 READ 与结构化 CLOSE 具备明确的生命周期。关闭操
 handle，再发送一次 CLOSE，避免并发清理重复发送。上述每个 vendor 修改点均在源码带有
 `[Berth patch]` 标记，位置为 `Sources/Citadel/SFTP/Client/SFTPFile.swift` 及
 `Sources/Citadel/SFTP/Client/SFTPClient.swift` 的构造调用。
+
+## 补丁:PTY / TTY 退出时清理 channel.close 不覆盖业务结果
+
+**动机**:
+Citadel 的 `withPTY` 与 `withTTY` 在业务闭包 `perform` 执行完毕后调用 `channel.close()` 进行通道清理。当远端 shell 正常 exit 时，远端已先发送 EOF / exit-status / CHANNEL_CLOSE，此时 NIOSSH 会让后续的重复 close 抛出 `ChannelError.alreadyClosed`。原逻辑直接把该 cleanup 错误抛出，导致上层（Berth）将正常的 shell exit 误判为 `transportFailure`，进而触发自动重连。同时，当 `perform` 自身发生异常时，原逻辑在 `catch` 块中调用 `try await close()`，若 `close()` 失败会直接覆盖 `perform` 的原始错误。
+
+**Patch 行为**:
+- `perform` 正常完成后的清理忽略 `ChannelError.alreadyClosed` 和 `ChannelError.eof`，视作正常关闭，保持业务成功结果。
+- `perform` 抛出异常进入 `catch` 时，清理采用 best-effort（`try? await channel.close()`），确保原始业务错误（如 `tcpShutdown` 或其他 I/O 错误）原样向外抛出，不被覆盖。
+- 源码位置：`vendor/Citadel/Sources/Citadel/TTY/Client/TTY.swift`，以 `[Berth patch]` 注释标记。
