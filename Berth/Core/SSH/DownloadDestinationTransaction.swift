@@ -10,13 +10,16 @@ import Foundation
 /// 5. 取消或失败时 discard 删除 working path, 原 finalURL 完好无损。
 public struct DownloadDestinationTransaction: Sendable {
     public enum TransactionError: LocalizedError, Equatable {
-        case destinationDirectoryNotEmpty(URL)
+        case destinationDirectoryAlreadyExists(URL)
+        case workingItemMissing(URL)
         case invalidParentDirectory(URL)
 
         public var errorDescription: String? {
             switch self {
-            case .destinationDirectoryNotEmpty(let url):
-                return String(localized: "目标目录已存在且不为空: \(url.lastPathComponent)")
+            case .destinationDirectoryAlreadyExists(let url):
+                return String(localized: "目标目录已存在: \(url.lastPathComponent)")
+            case .workingItemMissing(let url):
+                return String(localized: "下载临时工作项不存在: \(url.lastPathComponent)")
             case .invalidParentDirectory(let url):
                 return String(localized: "目标父目录无效: \(url.path)")
             }
@@ -77,8 +80,8 @@ public struct DownloadDestinationTransaction: Sendable {
 
     public func commit() throws {
         guard fileManager.fileExists(atPath: workingURL.path) else {
-            // 若 workingURL 未在磁盘上物化（例如仅在内存中模拟的测试执行器），无需也无法提交到 finalURL
-            return
+            // fail-closed: 临时工作项不存在时绝对不得假装提交成功
+            throw TransactionError.workingItemMissing(workingURL)
         }
 
         var isDir: ObjCBool = false
@@ -95,17 +98,11 @@ public struct DownloadDestinationTransaction: Sendable {
                 backupItemName: nil,
                 options: []
             )
-        } else if isDirectory && isDir.boolValue {
-            // final 是已存在目录: 如果非空则拒绝静默合并, 避免不可逆覆盖
-            let contents = try fileManager.contentsOfDirectory(atPath: finalURL.path)
-            if contents.isEmpty {
-                try fileManager.removeItem(at: finalURL)
-                try fileManager.moveItem(at: workingURL, to: finalURL)
-            } else {
-                throw TransactionError.destinationDirectoryNotEmpty(finalURL)
-            }
+        } else if isDir.boolValue {
+            // final 是已存在目录 (无论空或非空): 一律拒绝替换, 绝不通过 remove + move 等非事务窗口操作
+            throw TransactionError.destinationDirectoryAlreadyExists(finalURL)
         } else {
-            // 文件与目录类型冲突
+            // 文件与目录类型冲突 (例如 final 是已存在文件但下载的是目录)
             throw CocoaError(.fileWriteFileExists)
         }
     }
