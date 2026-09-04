@@ -289,6 +289,7 @@ final class SFTPBrowser {
     private static let uploadChunkSize = 256 * 1024
 
     private var downloadTasks: [UUID: Task<SFTPDownloadEngine.SFTPDownloadResult, Error>] = [:]
+    private var cancellationHandlers: [UUID: @Sendable () -> Void] = [:]
 
     typealias DownloadExecutor = @Sendable (
         _ entry: Entry,
@@ -351,7 +352,11 @@ final class SFTPBrowser {
         guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
         guard transfers[index].canCancel, !transfers[index].isCancelling else { return }
         transfers[index].isCancelling = true
-        downloadTasks[id]?.cancel()
+        if let handler = cancellationHandlers[id] {
+            handler()
+        } else {
+            downloadTasks[id]?.cancel()
+        }
     }
 
     private func setTransfer(_ id: UUID, label: String) {
@@ -425,10 +430,6 @@ final class SFTPBrowser {
             progress: !entry.isDirectory && entry.size > 0 ? 0 : nil,
             canCancel: true
         )
-        defer {
-            downloadTasks.removeValue(forKey: transferID)
-            endTransfer(transferID)
-        }
         let sink = SFTPDownloadProgressSink(progress: externalProgress) { [weak self] update in
             guard let self else { return }
             if let totalBytes = update.totalBytes, totalBytes > 0 {
@@ -469,6 +470,21 @@ final class SFTPBrowser {
             )
         }
         downloadTasks[transferID] = transferTask
+        if let externalProgress {
+            cancellationHandlers[transferID] = { [weak externalProgress] in
+                externalProgress?.cancel()
+                transferTask.cancel()
+            }
+        } else {
+            cancellationHandlers[transferID] = {
+                transferTask.cancel()
+            }
+        }
+        defer {
+            cancellationHandlers.removeValue(forKey: transferID)
+            downloadTasks.removeValue(forKey: transferID)
+            endTransfer(transferID)
+        }
 
         if Task.isCancelled {
             transferTask.cancel()
@@ -913,6 +929,8 @@ final class SFTPBrowser {
         editTasks = [:]
         editLocalURLs = [:]
         editing = [:]
+        for handler in cancellationHandlers.values { handler() }
+        cancellationHandlers = [:]
         for task in downloadTasks.values { task.cancel() }
         downloadTasks = [:]
         let client = sftp
