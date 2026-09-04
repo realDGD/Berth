@@ -148,6 +148,7 @@ final class SFTPBrowser {
     /// (sshd 未启用 SFTP 子系统 / MaxSessions 限制),15s 看门狗置失败态可重试。
     func start() async {
         guard sftp == nil, state != .loading else { return }
+        Task { _ = try? await SFTPDragStagingStore.shared.sweepStale() }
         state = .loading
         let opening = Task { try await self.opener() }
         let watchdog = Task { [weak self] in
