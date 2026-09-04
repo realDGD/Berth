@@ -269,7 +269,10 @@ extension SSHClient {
     }
 
     /// [Berth patch] 跟踪命令或会话流的终止状态。
-    /// 交互式 PTY/TTY 在未收到 exit-status/exit-signal 且 channel 异常关闭时，必须产生 transport error。
+    /// RFC 4254 §6.10 规定发送 exit-status 属于 RECOMMENDED (SHOULD) 而非 MUST。
+    /// 为避免底层连接断开或静默拆除被误判为 cleanShellExit 导致终端 tab 被误关，
+    /// Berth 刻意采用保守的 fail-closed 策略：交互式 PTY/TTY 会话必须收到明确退出证据（exit-status 或 exit-signal），
+    /// EOF 才能以 clean finish 正常结束；缺少证据时产生 transport error (ChannelError.eof)。
     public struct CommandStreamTerminationState: Sendable, Equatable {
         public let isInteractive: Bool
         public var exitCode: Int?
@@ -293,9 +296,9 @@ extension SSHClient {
                 if hasExitEvidence {
                     return .success(())
                 } else {
-                    // 交互式 PTY/TTY 在未收到任何退出状态证据的情况下收到 EOF，
-                    // 说明底层连接被异常断开或通道被破坏，必须抛出 transport error，
-                    // 避免被上层误判为 cleanShellExit 导致终端窗口被误关。
+                    // 交互式 PTY/TTY 在未收到任何退出证据（exit-status 或 exit-signal）的情况下收到 EOF。
+                    // 依据 Berth 保守的 fail-closed 策略（防范静默传输拆除误关终端），
+                    // 将其判定为 transport error (ChannelError.eof)，确保上层归类为 transportFailure 并保留终端 tab。
                     return .failure(ChannelError.eof)
                 }
             } else {

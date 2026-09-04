@@ -299,7 +299,10 @@ final class SessionTerminationClassifierTests: XCTestCase {
     }
 
     func testInteractiveTerminationStateWithoutExitEvidenceYieldsTransportError() {
-        // Transport teardown: handler removed without exit evidence
+        // Transport teardown / omitted exit evidence:
+        // RFC 4254 §6.10 specifies sending exit-status is RECOMMENDED (SHOULD, not MUST).
+        // Berth deliberately adopts a conservative fail-closed policy requiring explicit exit evidence
+        // (exit-status or exit-signal) for interactive PTY/TTY sessions to distinguish clean exit from transport teardown.
         let stateTeardown = SSHClient.CommandStreamTerminationState(isInteractive: true, exitCode: nil, exitSignal: nil)
         let resTeardown = stateTeardown.resolveTermination(error: nil)
         switch resTeardown {

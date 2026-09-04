@@ -193,4 +193,8 @@ handle，再发送一次 CLOSE，避免并发清理重复发送。上述每个 v
   - `perform` 正常完成后的清理忽略 `ChannelError.alreadyClosed` 和 `ChannelError.eof`，视作正常关闭，保持业务成功结果。
   - `perform` 抛出异常进入 `catch` 时，清理采用 best-effort（`try? await channel.close()`），确保原始业务错误（如 `tcpShutdown`、`ChannelError.eof` 或其他 I/O 错误）原样向外抛出，绝不被覆盖。
 - **统一生命周期**：抽取 `SSHClient.executeTTYLifecycle`，供 `withPTY`、`withTTY` 以及单元测试直接共用同一生产逻辑。
+- **RFC 4254 规范与退出证据策略 (Exit Evidence Policy)**：
+  - 根据 RFC 4254 §6.10 规定，服务端发送 `exit-status` 属于 `RECOMMENDED`（规范语义等价于 `SHOULD`），而非 `MUST`。因此，部分合法合规的 SSH 服务端实现可能省略 `exit-status`。
+  - Berth 为了防止将网络中断、TCP reset 或 sshd 被 kill 等静默传输拆除误判为正常退出（`cleanShellExit`）导致终端 Tab 误关，**主动采取比协议最低要求更严格的保守 fail-closed 策略**：交互式会话必须收到明确的远端退出证据（`exit-status` 或 `exit-signal`），EOF 才能被解析为正常结束。
+  - 对于合法省略 `exit-status` 的服务端，在连接关闭时将被保守归类为 `transportFailure`，保留终端 Tab 与历史回滚缓冲区，绝不因缺少证据而静默销毁用户工作现场。
 - 源码位置：`vendor/Citadel/Sources/Citadel/TTY/Client/TTY.swift`，以 `[Berth patch]` 注释标记。
