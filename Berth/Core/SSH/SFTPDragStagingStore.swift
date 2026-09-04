@@ -23,6 +23,7 @@ public struct StagingMarkerMetadata: Codable, Sendable, Equatable {
     public let payloadName: String
     public let isDirectory: Bool
     public var payloadBytes: UInt64?
+    public var orphanedAt: Date?
 
     public init(
         schemaVersion: Int = 1,
@@ -32,7 +33,8 @@ public struct StagingMarkerMetadata: Codable, Sendable, Equatable {
         deliveredAt: Date? = nil,
         payloadName: String,
         isDirectory: Bool,
-        payloadBytes: UInt64? = nil
+        payloadBytes: UInt64? = nil,
+        orphanedAt: Date? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.id = id
@@ -42,6 +44,7 @@ public struct StagingMarkerMetadata: Codable, Sendable, Equatable {
         self.payloadName = payloadName
         self.isDirectory = isDirectory
         self.payloadBytes = payloadBytes
+        self.orphanedAt = orphanedAt
     }
 }
 
@@ -278,14 +281,32 @@ public actor SFTPDragStagingStore {
                     let retention = SFTPDragRetentionPolicy.retentionInterval(payloadBytes: metadata.payloadBytes)
                     shouldReclaim = now.timeIntervalSince(deliveredAt) >= retention
                 } else {
-                    // 未成功投递 (下载中或中断): 区分崩溃残留与存活进程
-                    let age = now.timeIntervalSince(metadata.createdAt)
-                    if age >= absoluteCeiling {
-                        shouldReclaim = true
-                    } else if metadata.pid != ProcessInfo.processInfo.processIdentifier {
-                        let isDead = !processLivenessChecker(metadata.pid)
-                        shouldReclaim = isDead || age >= interruptedGracePeriod
+                    // 未成功投递 (下载中或中断):
+                    if metadata.pid != ProcessInfo.processInfo.processIdentifier {
+                        let isAlive = processLivenessChecker(metadata.pid)
+                        if isAlive {
+                            // 核心安全保证: 只要所有者进程确认存活, 绝不删除! 无论 age 经过多久 (30min/2h/48h)
+                            if metadata.orphanedAt != nil {
+                                var updated = metadata
+                                updated.orphanedAt = nil
+                                updateMarker(updated, at: markerURL)
+                            }
+                            shouldReclaim = false
+                        } else {
+                            // 所有者进程已确认死亡: 必须以首次检测到死亡的 orphanedAt 为起点计算 grace period
+                            if let orphanedAt = metadata.orphanedAt {
+                                shouldReclaim = now.timeIntervalSince(orphanedAt) >= interruptedGracePeriod
+                            } else {
+                                // 首次检测到所有者死亡: 写入 orphanedAt 标记, 本次 sweep 绝不删除
+                                var updated = metadata
+                                updated.orphanedAt = now
+                                updateMarker(updated, at: markerURL)
+                                shouldReclaim = false
+                            }
+                        }
                     } else {
+                        // 同进程 (但已不在 activeLeases 中): 说明为此前崩溃或未正常清理的残留
+                        let age = now.timeIntervalSince(metadata.createdAt)
                         shouldReclaim = age >= interruptedGracePeriod
                     }
                 }
@@ -346,6 +367,14 @@ public actor SFTPDragStagingStore {
         guard let timestamp else { return false }
 
         return now.timeIntervalSince(timestamp) >= legacyGracePeriod
+    }
+
+    private func updateMarker(_ metadata: StagingMarkerMetadata, at markerURL: URL) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(metadata) {
+            try? markerWriter(data, markerURL)
+        }
     }
 
     /// 严格安全检查并删除单个标准 staging root (必须含有 marker)

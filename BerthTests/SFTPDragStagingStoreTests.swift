@@ -250,9 +250,10 @@ final class SFTPDragStagingStoreTests: XCTestCase {
     }
 
     func testCrashInterruptedLeaseFromDeadPIDIsSwept() async throws {
-        // Lease created by a dead process (mocked via ESRCH in custom checker)
+        // Lease created by a dead process (mocked via false in custom checker)
         let customStore = SFTPDragStagingStore(
             baseDirectory: tempDirectoryURL,
+            interruptedGracePeriod: 3600,
             processLivenessChecker: { _ in false } // simulate dead process
         )
 
@@ -260,11 +261,12 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         let rootURL = tempDirectoryURL.appendingPathComponent("\(SFTPDragStagingStore.prefix)\(deadLeaseID.uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
 
+        let t0 = Date()
         let metadata = StagingMarkerMetadata(
             schemaVersion: 1,
             id: deadLeaseID,
             pid: 999999,
-            createdAt: Date().addingTimeInterval(-120),
+            createdAt: t0.addingTimeInterval(-7200),
             deliveredAt: nil,
             payloadName: "crashed_payload",
             isDirectory: true
@@ -275,9 +277,71 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         let data = try encoder.encode(metadata)
         try data.write(to: markerURL)
 
-        let sweepResult = try await customStore.sweepStale(now: Date())
-        XCTAssertEqual(sweepResult.reclaimedCount, 1)
+        // First sweep: dead owner detected -> writes orphanedAt, MUST NOT delete immediately
+        let firstSweep = try await customStore.sweepStale(now: t0)
+        XCTAssertEqual(firstSweep.reclaimedCount, 0, "First sweep upon discovering dead owner must record orphanedAt and keep staging")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
+
+        // Read back marker to verify orphanedAt was recorded
+        let updatedData = try Data(contentsOf: markerURL)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let updatedMetadata = try decoder.decode(StagingMarkerMetadata.self, from: updatedData)
+        XCTAssertNotNil(updatedMetadata.orphanedAt)
+
+        // 30 mins after orphanedAt (grace is 60m): still kept
+        let intermediateSweep = try await customStore.sweepStale(now: t0.addingTimeInterval(1800))
+        XCTAssertEqual(intermediateSweep.reclaimedCount, 0, "Within grace period after dead owner detection, staging must be kept")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
+
+        // 65 mins after orphanedAt: grace passed -> swept
+        let expiredSweep = try await customStore.sweepStale(now: t0.addingTimeInterval(3900))
+        XCTAssertEqual(expiredSweep.reclaimedCount, 1, "After grace period from orphanedAt, dead lease must be reclaimed")
         XCTAssertFalse(FileManager.default.fileExists(atPath: rootURL.path))
+    }
+
+    func testForeignOwnerAliveKeptAt30Min2HoursAnd48Hours() async throws {
+        let customStore = SFTPDragStagingStore(
+            baseDirectory: tempDirectoryURL,
+            interruptedGracePeriod: 3600,   // 1 hour
+            absoluteCeiling: 86400,         // 24 hours
+            processLivenessChecker: { _ in true } // foreign owner process is STILL ALIVE
+        )
+
+        let leaseID = UUID()
+        let rootURL = tempDirectoryURL.appendingPathComponent("\(SFTPDragStagingStore.prefix)\(leaseID.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+
+        let t0 = Date()
+        let metadata = StagingMarkerMetadata(
+            schemaVersion: 1,
+            id: leaseID,
+            pid: 777777,
+            createdAt: t0,
+            deliveredAt: nil,
+            payloadName: "large_active_download",
+            isDirectory: true
+        )
+        let markerURL = rootURL.appendingPathComponent(SFTPDragStagingStore.markerFilename)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(metadata)
+        try data.write(to: markerURL)
+
+        // 30 mins later: owner alive -> KEEP
+        let sweep30m = try await customStore.sweepStale(now: t0.addingTimeInterval(1800))
+        XCTAssertEqual(sweep30m.reclaimedCount, 0, "Foreign active lease with live owner must be kept at 30 min")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
+
+        // 2 hours later (exceeds interruptedGracePeriod 1h): owner alive -> KEEP
+        let sweep2h = try await customStore.sweepStale(now: t0.addingTimeInterval(7200))
+        XCTAssertEqual(sweep2h.reclaimedCount, 0, "Foreign active lease with live owner must be kept at 2 hours")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
+
+        // 48 hours later (exceeds absoluteCeiling 24h): owner alive -> KEEP
+        let sweep48h = try await customStore.sweepStale(now: t0.addingTimeInterval(48 * 3600))
+        XCTAssertEqual(sweep48h.reclaimedCount, 0, "Foreign active lease with live owner must be kept even at 48 hours")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
     }
 
     func testInterruptedLeaseFromAlivePIDIsProtected() async throws {
