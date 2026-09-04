@@ -299,10 +299,12 @@ enum SFTPDownloadEngine {
     /// only enqueue/coalesce from the engine actor; they never wait for a potentially slow UI
     /// actor. `finish()` closes the stream and awaits that one task, so the final event is ordered
     /// before the public operation returns without creating one unstructured task per READ.
-    private actor ProgressAccumulator {
+    internal actor ProgressAccumulator {
         private var totalBytes: UInt64?
         private var unresolvedFileSizes: Int
-        private var observedKnownTotal: UInt64 = 0
+        /// The effective sum for files whose size is known.  This remains useful while the
+        /// directory total is indeterminate because one or more other files still need FSTAT/EOF.
+        private var knownBytes: UInt64
         private let sink: @Sendable (ProgressUpdate) async -> Void
         private let streamContinuation: AsyncStream<ProgressUpdate>.Continuation
         private let deliveryTask: Task<Void, Never>
@@ -313,10 +315,12 @@ enum SFTPDownloadEngine {
         init(
             totalBytes: UInt64?,
             unresolvedFileSizes: Int,
+            knownBytes: UInt64 = 0,
             sink: @escaping @Sendable (ProgressUpdate) async -> Void
         ) {
             self.totalBytes = totalBytes
             self.unresolvedFileSizes = max(0, unresolvedFileSizes)
+            self.knownBytes = knownBytes
             self.sink = sink
 
             var continuation: AsyncStream<ProgressUpdate>.Continuation!
@@ -340,28 +344,38 @@ enum SFTPDownloadEngine {
         /// directory total, adjust the denominator by the snapshot-vs-listing delta.  If scanning
         /// found an unknown file, publish a total only after every file has an effective size.
         func observeFileSize(listedSize: UInt64?, snapshotSize: UInt64?) {
-            if let totalBytes {
-                if let listedSize, let snapshotSize {
+            if let listedSize {
+                guard let snapshotSize else { return }
+                if let totalBytes {
                     self.totalBytes = adjustedTotal(
                         totalBytes,
                         listedSize: listedSize,
                         snapshotSize: snapshotSize
                     )
-                    enqueueCurrent()
+                } else {
+                    knownBytes = adjustedTotal(
+                        knownBytes,
+                        listedSize: listedSize,
+                        snapshotSize: snapshotSize
+                    )
+                    if unresolvedFileSizes == 0 {
+                        self.totalBytes = knownBytes
+                    }
                 }
+                enqueueCurrent()
                 return
             }
 
             guard unresolvedFileSizes > 0 else { return }
-            guard let effectiveSize = snapshotSize ?? listedSize else {
+            guard let snapshotSize else {
                 // This file will use the EOF-terminated fallback; the directory denominator
                 // remains unknown because no future value can be inferred safely.
                 return
             }
-            observedKnownTotal = saturatingAdd(observedKnownTotal, effectiveSize)
+            knownBytes = saturatingAdd(knownBytes, snapshotSize)
             unresolvedFileSizes -= 1
             if unresolvedFileSizes == 0 {
-                totalBytes = observedKnownTotal
+                totalBytes = knownBytes
             }
             enqueueCurrent()
         }
@@ -610,7 +624,8 @@ enum SFTPDownloadEngine {
         await onPlan(plan)
         let reporter = ProgressAccumulator(
             totalBytes: plan.totalBytes,
-            unresolvedFileSizes: plan.totalBytes == nil ? plan.files.count : 0,
+            unresolvedFileSizes: plan.files.filter { $0.size == nil }.count,
+            knownBytes: plan.files.compactMap(\.size).reduce(0, saturatingAdd),
             sink: onProgress
         )
         await reporter.emitInitial()
@@ -850,6 +865,13 @@ enum SFTPDownloadEngine {
                         write: writeAtOffset,
                         onBytes: onBytes
                     )
+                    // If FSTAT could not provide a size, the EOF-terminated copy is the first
+                    // reliable size observation for this file.  Resolve it before the directory
+                    // progress reporter finishes, otherwise a mixed known/unknown directory can
+                    // remain indeterminate forever.
+                    if expectedSize == nil, snapshotSize == nil {
+                        await onFileSize(nil, copied)
+                    }
                 }
                 try localHandle.close()
                 DebugLog.append("sftp file done name=\(localURL.lastPathComponent) copied=\(copied)")

@@ -730,6 +730,33 @@ final class SFTPBrowserTests: XCTestCase {
         XCTAssertEqual(browser.configuration.handleLimit, 4)
         XCTAssertEqual(browser.configuration.maxConcurrentFiles, 4)
     }
+
+    func testProgressAccumulatorKeepsKnownAndUnknownFileSizesSeparate() async {
+        let updates = SFTPLockedValue<[SFTPDownloadEngine.ProgressUpdate]>([])
+        let reporter = SFTPDownloadEngine.ProgressAccumulator(
+            totalBytes: nil,
+            unresolvedFileSizes: 1,
+            knownBytes: 100
+        ) { update in
+            updates.withValue { $0.append(update) }
+        }
+
+        await reporter.emitInitial()
+        // The known file is refreshed by FSTAT from 100 to 120 bytes.  It must not consume the
+        // unresolved slot belonging to the second, unknown-size file.
+        await reporter.observeFileSize(listedSize: 100, snapshotSize: 120)
+        await reporter.add(120)
+        await reporter.observeFileSize(listedSize: nil, snapshotSize: nil)
+        await reporter.add(80)
+        // The unknown file has no FSTAT size; its EOF-terminated copy resolves the denominator.
+        await reporter.observeFileSize(listedSize: nil, snapshotSize: 80)
+        await reporter.finish()
+
+        let finished = updates.snapshot().last { $0.isFinished }
+        XCTAssertEqual(finished?.totalBytes, 200)
+        XCTAssertEqual(finished?.completedBytes, 200)
+    }
+
     func testDirectoryMaterializationHandlesRootSentinelAndNestedDirectories() throws {
         let tempRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("MaterializeTest-\(UUID().uuidString)", isDirectory: true)
