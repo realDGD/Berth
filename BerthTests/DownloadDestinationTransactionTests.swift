@@ -120,9 +120,33 @@ final class DownloadDestinationTransactionTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: finalURL.appendingPathComponent("sub/1.txt").path))
     }
 
-    // MARK: - 6. 目录 final 已存在且非空: 拒绝静默合并, 抛出明确冲突, 保护已有目录
+    // MARK: - 6. 目录 final 已存在 (空目录与非空目录): 均严格拒绝替换并保护原有目录
 
-    func testDirectoryFinalAlreadyExistsAndNonEmptyRefusesMerge() throws {
+    func testExistingEmptyDirectoryRefusesCommitAndPreservesFinal() throws {
+        let finalURL = tempDirectoryURL.appendingPathComponent("empty_existing_dir")
+        try FileManager.default.createDirectory(at: finalURL, withIntermediateDirectories: true)
+
+        let tx = try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: true)
+        try "REMOTE CONTENT".write(to: tx.workingURL.appendingPathComponent("remote.txt"), atomically: true, encoding: .utf8)
+
+        do {
+            try tx.commit()
+            XCTFail("Commit must throw when destination directory already exists")
+        } catch let error as DownloadDestinationTransaction.TransactionError {
+            XCTAssertEqual(error, .destinationDirectoryAlreadyExists(finalURL))
+        }
+
+        // Clean up transaction
+        tx.discard()
+
+        // Existing empty directory must NOT have been removed or merged
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finalURL.path))
+        let remaining = try FileManager.default.contentsOfDirectory(atPath: finalURL.path)
+        XCTAssertTrue(remaining.isEmpty, "Empty directory must remain empty and untouched")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+    }
+
+    func testExistingNonEmptyDirectoryRefusesCommitAndPreservesFinal() throws {
         let finalURL = tempDirectoryURL.appendingPathComponent("existing_folder")
         try FileManager.default.createDirectory(at: finalURL, withIntermediateDirectories: true)
         try "IMPORTANT LOCAL FILE".write(to: finalURL.appendingPathComponent("local.txt"), atomically: true, encoding: .utf8)
@@ -134,7 +158,7 @@ final class DownloadDestinationTransactionTests: XCTestCase {
             try tx.commit()
             XCTFail("Commit must throw when destination directory already exists and is non-empty")
         } catch let error as DownloadDestinationTransaction.TransactionError {
-            XCTAssertEqual(error, .destinationDirectoryNotEmpty(finalURL))
+            XCTAssertEqual(error, .destinationDirectoryAlreadyExists(finalURL))
         }
 
         // Clean up transaction
@@ -163,7 +187,86 @@ final class DownloadDestinationTransactionTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
     }
 
-    // MARK: - 8. 模拟写入失败 (例如 ENOSPC / 网络异常): discard 保留原 final
+    // MARK: - 8. fail-closed: missing working item 必须 throw
+
+    func testMissingWorkingFileFailsClosedAndPreservesFinal() throws {
+        let finalURL = tempDirectoryURL.appendingPathComponent("existing_safe.bin")
+        let originalBytes = "PRECIOUS PRE-EXISTING DATA".data(using: .utf8)!
+        try originalBytes.write(to: finalURL)
+
+        let tx = try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: false)
+
+        // Do NOT create working file
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+
+        do {
+            try tx.commit()
+            XCTFail("Commit must throw when working file was never created")
+        } catch let error as DownloadDestinationTransaction.TransactionError {
+            XCTAssertEqual(error, .workingItemMissing(tx.workingURL))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: finalURL), originalBytes, "Original file must be completely untouched")
+    }
+
+    func testMissingWorkingDirectoryFailsClosed() throws {
+        let finalURL = tempDirectoryURL.appendingPathComponent("target_dir")
+        let tx = try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: true)
+
+        // Remove the pre-created working directory to simulate missing payload
+        try FileManager.default.removeItem(at: tx.workingURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+
+        do {
+            try tx.commit()
+            XCTFail("Commit must throw when working directory is missing")
+        } catch let error as DownloadDestinationTransaction.TransactionError {
+            XCTAssertEqual(error, .workingItemMissing(tx.workingURL))
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: finalURL.path))
+    }
+
+    // MARK: - 9. 真实文件系统 commit 失败: 保护已有 final 不被破坏
+
+    func testCommitFailurePreservesOriginalFinal() throws {
+        let subFolder = tempDirectoryURL.appendingPathComponent("readonly_test_dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: subFolder, withIntermediateDirectories: true)
+
+        let finalURL = subFolder.appendingPathComponent("target.bin")
+        let originalContent = "ORIGINAL UNTOUCHED CONTENT"
+        try originalContent.write(to: finalURL, atomically: true, encoding: .utf8)
+
+        let tx = try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: false)
+        try "NEW CONTENT".write(to: tx.workingURL, atomically: true, encoding: .utf8)
+
+        // Make parent directory read-only to provoke a real filesystem failure during replaceItemAt
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: subFolder.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: subFolder.path)
+        }
+
+        var commitError: Error?
+        do {
+            try tx.commit()
+            XCTFail("Commit should fail in read-only directory")
+        } catch {
+            commitError = error
+        }
+
+        XCTAssertNotNil(commitError)
+
+        // Restore permissions and discard working
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: subFolder.path)
+        tx.discard()
+
+        // Original final file must be 100% intact
+        let finalRead = try String(contentsOf: finalURL, encoding: .utf8)
+        XCTAssertEqual(finalRead, originalContent, "Commit failure must leave finalURL completely intact")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+    }
+
+    // MARK: - 10. 模拟写入失败 (ENOSPC-equivalent failure cleanup regression): discard 保留原 final
 
     func testWriteFailurePreservesOriginalFinalAndCleansWorking() throws {
         let finalURL = tempDirectoryURL.appendingPathComponent("protected_existing.bin")
@@ -172,7 +275,7 @@ final class DownloadDestinationTransactionTests: XCTestCase {
 
         let tx = try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: false)
 
-        // Write partial before error
+        // Write partial before simulated failure
         try "partial before error".write(to: tx.workingURL, atomically: true, encoding: .utf8)
 
         // Simulate error handling block
