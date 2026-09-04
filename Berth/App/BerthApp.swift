@@ -7,6 +7,7 @@ final class BerthAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MenuBarItemController.shared.start()
         Task { _ = try? await SFTPDragStagingStore.shared.sweepStale() }
+        Task.detached { _ = try? DownloadDestinationTransaction.sweepOrphans() }
     }
 }
 

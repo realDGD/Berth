@@ -122,53 +122,59 @@ final class DownloadDestinationTransactionTests: XCTestCase {
 
     // MARK: - 6. 目录 final 已存在 (空目录与非空目录): 均严格拒绝替换并保护原有目录
 
-    func testExistingEmptyDirectoryRefusesCommitAndPreservesFinal() throws {
+    func testExistingEmptyDirectoryRefusesBeginAndPreservesFinal() throws {
         let finalURL = tempDirectoryURL.appendingPathComponent("empty_existing_dir")
         try FileManager.default.createDirectory(at: finalURL, withIntermediateDirectories: true)
 
-        let tx = try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: true)
-        try "REMOTE CONTENT".write(to: tx.workingURL.appendingPathComponent("remote.txt"), atomically: true, encoding: .utf8)
-
-        do {
-            try tx.commit()
-            XCTFail("Commit must throw when destination directory already exists")
-        } catch let error as DownloadDestinationTransaction.TransactionError {
-            XCTAssertEqual(error, .destinationDirectoryAlreadyExists(finalURL))
+        XCTAssertThrowsError(
+            try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: true)
+        ) { error in
+            XCTAssertEqual(
+                error as? DownloadDestinationTransaction.TransactionError,
+                .destinationDirectoryAlreadyExists(finalURL)
+            )
         }
-
-        // Clean up transaction
-        tx.discard()
 
         // Existing empty directory must NOT have been removed or merged
         XCTAssertTrue(FileManager.default.fileExists(atPath: finalURL.path))
         let remaining = try FileManager.default.contentsOfDirectory(atPath: finalURL.path)
         XCTAssertTrue(remaining.isEmpty, "Empty directory must remain empty and untouched")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+        XCTAssertFalse(try directoryContainsWorkingItem(for: finalURL))
     }
 
-    func testExistingNonEmptyDirectoryRefusesCommitAndPreservesFinal() throws {
+    func testExistingNonEmptyDirectoryRefusesBeginAndPreservesFinal() throws {
         let finalURL = tempDirectoryURL.appendingPathComponent("existing_folder")
         try FileManager.default.createDirectory(at: finalURL, withIntermediateDirectories: true)
         try "IMPORTANT LOCAL FILE".write(to: finalURL.appendingPathComponent("local.txt"), atomically: true, encoding: .utf8)
 
-        let tx = try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: true)
-        try "REMOTE NEW FILE".write(to: tx.workingURL.appendingPathComponent("remote.txt"), atomically: true, encoding: .utf8)
-
-        do {
-            try tx.commit()
-            XCTFail("Commit must throw when destination directory already exists and is non-empty")
-        } catch let error as DownloadDestinationTransaction.TransactionError {
-            XCTAssertEqual(error, .destinationDirectoryAlreadyExists(finalURL))
+        XCTAssertThrowsError(
+            try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: true)
+        ) { error in
+            XCTAssertEqual(
+                error as? DownloadDestinationTransaction.TransactionError,
+                .destinationDirectoryAlreadyExists(finalURL)
+            )
         }
-
-        // Clean up transaction
-        tx.discard()
 
         // Existing folder must remain completely intact
         XCTAssertTrue(FileManager.default.fileExists(atPath: finalURL.appendingPathComponent("local.txt").path))
         let content = try String(contentsOf: finalURL.appendingPathComponent("local.txt"), encoding: .utf8)
         XCTAssertEqual(content, "IMPORTANT LOCAL FILE")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+        XCTAssertFalse(try directoryContainsWorkingItem(for: finalURL))
+    }
+
+    func testDirectoryDownloadRefusesExistingFileBeforeCreatingWorkingItem() throws {
+        let finalURL = tempDirectoryURL.appendingPathComponent("existing_file")
+        try "LOCAL DATA".write(to: finalURL, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(
+            try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: true)
+        ) { error in
+            XCTAssertEqual((error as? CocoaError)?.code, .fileWriteFileExists)
+        }
+
+        XCTAssertEqual(try String(contentsOf: finalURL, encoding: .utf8), "LOCAL DATA")
+        XCTAssertFalse(try directoryContainsWorkingItem(for: finalURL))
     }
 
     // MARK: - 7. 目录下载取消: working 树被完全删除, final 不存在
@@ -285,5 +291,105 @@ final class DownloadDestinationTransactionTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: finalURL), originalBytes)
         XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
         XCTAssertEqual(simulatedError.code, .ENOSPC)
+    }
+
+    // MARK: - 11. 原子交换与崩溃恢复
+
+    func testAtomicExchangeFailureLeavesOriginalAtFinal() throws {
+        let finalURL = tempDirectoryURL.appendingPathComponent("exchange_failure.bin")
+        try "ORIGINAL DATA".write(to: finalURL, atomically: true, encoding: .utf8)
+
+        struct SimulatedExchangeError: Error, Equatable {}
+        let registry = DownloadTransactionRegistry(
+            baseDirectory: tempDirectoryURL.appendingPathComponent("registry", isDirectory: true)
+        )
+        let tx = try DownloadDestinationTransaction.begin(
+            finalURL: finalURL,
+            isDirectory: false,
+            itemExchanger: { _, _ in throw SimulatedExchangeError() },
+            registry: registry
+        )
+        try "NEW CONTENT".write(to: tx.workingURL, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(try tx.commit()) { error in
+            XCTAssertTrue(error is SimulatedExchangeError)
+        }
+        XCTAssertEqual(try String(contentsOf: finalURL, encoding: .utf8), "ORIGINAL DATA")
+        XCTAssertEqual(try String(contentsOf: tx.workingURL, encoding: .utf8), "NEW CONTENT")
+
+        tx.discard()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+    }
+
+    func testSweepDoesNotRemoveActiveTransaction() throws {
+        let registry = DownloadTransactionRegistry(
+            baseDirectory: tempDirectoryURL.appendingPathComponent("active-registry", isDirectory: true)
+        )
+        let finalURL = tempDirectoryURL.appendingPathComponent("active.bin")
+        let tx = try DownloadDestinationTransaction.begin(
+            finalURL: finalURL,
+            isDirectory: false,
+            registry: registry
+        )
+        try "PARTIAL".write(to: tx.workingURL, atomically: true, encoding: .utf8)
+
+        // 另一实例使用独立 registry 对象打开同一 lock 文件，模拟第二个 Berth 进程 sweep。
+        let sweeper = DownloadTransactionRegistry(baseDirectory: registry.baseDirectory)
+        let result = try sweeper.sweepOrphans()
+
+        XCTAssertEqual(result.examinedCount, 1)
+        XCTAssertEqual(result.reclaimedCount, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tx.workingURL.path))
+        tx.discard()
+    }
+
+    func testSweepRemovesAbandonedFileTransaction() throws {
+        let registry = DownloadTransactionRegistry(
+            baseDirectory: tempDirectoryURL.appendingPathComponent("orphan-registry", isDirectory: true)
+        )
+        let finalURL = tempDirectoryURL.appendingPathComponent("orphan.bin")
+        let tx = try DownloadDestinationTransaction.begin(
+            finalURL: finalURL,
+            isDirectory: false,
+            registry: registry
+        )
+        try "PARTIAL".write(to: tx.workingURL, atomically: true, encoding: .utf8)
+        tx.abandonWithoutCleanup()
+
+        let result = try registry.sweepOrphans()
+
+        XCTAssertEqual(result.reclaimedCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: finalURL.path))
+    }
+
+    func testSweepRemovesAbandonedDirectoryTransaction() throws {
+        let registry = DownloadTransactionRegistry(
+            baseDirectory: tempDirectoryURL.appendingPathComponent("orphan-directory-registry", isDirectory: true)
+        )
+        let finalURL = tempDirectoryURL.appendingPathComponent("orphan-directory", isDirectory: true)
+        let tx = try DownloadDestinationTransaction.begin(
+            finalURL: finalURL,
+            isDirectory: true,
+            registry: registry
+        )
+        try "PARTIAL".write(
+            to: tx.workingURL.appendingPathComponent("nested.chk"),
+            atomically: true,
+            encoding: .utf8
+        )
+        tx.abandonWithoutCleanup()
+
+        let result = try registry.sweepOrphans()
+
+        XCTAssertEqual(result.reclaimedCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: finalURL.path))
+    }
+
+    private func directoryContainsWorkingItem(for finalURL: URL) throws -> Bool {
+        let prefix = ".\(finalURL.lastPathComponent).berth-part-"
+        return try FileManager.default.contentsOfDirectory(atPath: finalURL.deletingLastPathComponent().path)
+            .contains { $0.hasPrefix(prefix) }
     }
 }

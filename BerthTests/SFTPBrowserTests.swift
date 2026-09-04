@@ -889,6 +889,49 @@ final class SFTPBrowserTests: XCTestCase {
 
     // MARK: - Download Cancellation Tests
 
+    func testExistingDestinationDirectoryFailsBeforeStartingRemoteTransfer() async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ExistingDestination-\(UUID().uuidString)", isDirectory: true)
+        let finalURL = tempDirectory.appendingPathComponent("remote-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: finalURL, withIntermediateDirectories: true)
+        try "LOCAL".write(
+            to: finalURL.appendingPathComponent("keep.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let browser = SFTPBrowser { throw CocoaError(.fileNoSuchFile) }
+        let transferStarted = expectation(description: "remote transfer must not start")
+        transferStarted.isInverted = true
+        browser.downloadExecutor = { _, _, _, _, _, _, _, _ in
+            transferStarted.fulfill()
+            return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 0)
+        }
+
+        let entry = SFTPBrowser.Entry(
+            name: "remote-project",
+            isDirectory: true,
+            isSymlink: false,
+            size: 0,
+            sizeIsKnown: false,
+            modified: Date()
+        )
+        await browser.download(entry, to: finalURL)
+        await fulfillment(of: [transferStarted], timeout: 0.1)
+
+        XCTAssertEqual(
+            try String(contentsOf: finalURL.appendingPathComponent("keep.txt"), encoding: .utf8),
+            "LOCAL"
+        )
+        XCTAssertTrue(browser.transfers.isEmpty)
+        if case .failed = browser.state {
+            // Expected: the conflict is surfaced without starting any SFTP work.
+        } else {
+            XCTFail("Existing destination directory must fail before transfer")
+        }
+    }
+
     func testSingleDownloadCancellation() async throws {
         let browser = SFTPBrowser {
             throw CocoaError(.fileNoSuchFile)
@@ -938,6 +981,56 @@ final class SFTPBrowserTests: XCTestCase {
         XCTAssertEqual(browser.transfers.count, 0)
         if case .failed = browser.state {
             XCTFail("Browser state must NOT be .failed when user cancels transfer")
+        }
+    }
+
+    func testCancelledExecutorCannotCommitAfterReturningSuccess() async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CancelCommitRace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let finalURL = tempDirectory.appendingPathComponent("result.bin")
+        try Data("ORIGINAL".utf8).write(to: finalURL)
+
+        let browser = SFTPBrowser {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let entry = SFTPBrowser.Entry(
+            name: "result.bin",
+            isDirectory: false,
+            isSymlink: false,
+            size: 8,
+            sizeIsKnown: true,
+            modified: Date()
+        )
+        let workingReady = expectation(description: "working file ready")
+
+        browser.downloadExecutor = { _, _, localURL, _, _, _, _, _ in
+            try Data("NEW DATA".utf8).write(to: localURL)
+            workingReady.fulfill()
+            // 模拟底层在最终 CLOSE 后忽略取消并正常返回；Task cancellation 本身不会强制 throw。
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 8)
+        }
+
+        let downloadTask = Task {
+            await browser.download(entry, to: finalURL)
+        }
+        await fulfillment(of: [workingReady], timeout: 2.0)
+        let transfer = try XCTUnwrap(browser.transfers.first)
+
+        browser.cancelTransfer(transfer.id)
+        await downloadTask.value
+
+        XCTAssertEqual(try Data(contentsOf: finalURL), Data("ORIGINAL".utf8))
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: tempDirectory.path)
+            .filter { $0.contains(".berth-part-") }
+        XCTAssertTrue(leftovers.isEmpty)
+        if case .failed = browser.state {
+            XCTFail("A cancelled commit race must not put the browser in failed state")
         }
     }
 

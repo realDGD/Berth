@@ -375,20 +375,23 @@ final class SFTPBrowser {
 
     func download(_ entry: Entry, to localURL: URL) async {
         do {
-            let tx = try DownloadDestinationTransaction.begin(
+            let worker = DownloadDestinationTransactionWorker.shared
+            let tx = try await worker.begin(
                 finalURL: localURL,
                 isDirectory: entry.isDirectory
             )
             do {
+                try Task.checkCancellation()
                 try await performDownload(
                     entry,
                     remoteDirectory: path,
                     to: tx.workingURL,
                     externalProgress: nil
                 )
-                try tx.commit()
+                try Task.checkCancellation()
+                try await worker.commit(tx)
             } catch {
-                tx.discard()
+                await worker.discard(tx)
                 throw error
             }
         } catch is CancellationError {
@@ -501,7 +504,13 @@ final class SFTPBrowser {
         }
 
         return try await withTaskCancellationHandler {
-            try await transferTask.value
+            let result = try await transferTask.value
+            // Task cancellation is cooperative: a custom/finishing executor may return success
+            // after cancelTransfer() has already cancelled it. Never let that race reach commit().
+            if transferTask.isCancelled || Task.isCancelled {
+                throw CancellationError()
+            }
+            return result
         } onCancel: {
             transferTask.cancel()
         }
