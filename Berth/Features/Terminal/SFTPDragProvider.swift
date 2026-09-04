@@ -67,13 +67,40 @@ enum SFTPDragProvider {
                         await SFTPDragStagingStore.shared.discardIfDelivered(lease)
                     }
                 } catch {
-                    completion(nil, false, error)
                     await SFTPDragStagingStore.shared.discard(lease)
+                    let finalError = normalizedCancellationError(error)
+                    completion(nil, false, finalError)
                 }
             }
             progress.cancellationHandler = { task.cancel() }
             return progress
         }
         return provider
+    }
+
+    /// 判断是否为用户主动发起的取消操作 (覆盖 Swift.CancellationError, CocoaError(.userCancelled), Task.isCancelled)
+    static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        if let cocoa = error as? CocoaError, cocoa.code == .userCancelled {
+            return true
+        }
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain && nsError.code == CocoaError.userCancelled.rawValue {
+            return true
+        }
+        if Task.isCancelled {
+            return true
+        }
+        return false
+    }
+
+    /// 将取消类错误标准化为 CocoaError(.userCancelled), 其余真实错误原样保留
+    static func normalizedCancellationError(_ error: Error) -> Error {
+        if isCancellation(error) {
+            return CocoaError(.userCancelled)
+        }
+        return error
     }
 }
