@@ -121,6 +121,7 @@ final class SFTPBrowser {
     private(set) var transfers: [ActiveTransfer] = []
 
     private var sftp: SFTPClient?
+    public let configuration: SFTPTransferConfiguration
     /// One budget per browser/SFTP session.  Concurrent drag and panel downloads share this cap
     /// instead of creating an independent request window for every file or directory.
     private let transferBudget: SFTPDownloadEngine.TransferBudget
@@ -132,11 +133,14 @@ final class SFTPBrowser {
 
     init(
         initialPath: String? = nil,
-        transferBudget: SFTPDownloadEngine.TransferBudget = .init(),
+        configuration: SFTPTransferConfiguration = .init(),
+        transferBudget: SFTPDownloadEngine.TransferBudget? = nil,
         opener: @escaping () async throws -> SFTPClient
     ) {
+        let normalized = configuration.normalized
         self.initialPath = initialPath
-        self.transferBudget = transferBudget
+        self.configuration = normalized
+        self.transferBudget = transferBudget ?? SFTPDownloadEngine.TransferBudget(configuration: normalized)
         self.opener = opener
     }
 
@@ -336,6 +340,7 @@ final class SFTPBrowser {
                 localRoot: localURL,
                 sftp: sftp,
                 budget: transferBudget,
+                configuration: configuration,
                 onPlan: { [weak self] plan in
                     guard let self else { return }
                     await MainActor.run {
@@ -353,6 +358,7 @@ final class SFTPBrowser {
                 localURL: localURL,
                 sftp: sftp,
                 budget: transferBudget,
+                configuration: configuration,
                 onProgress: onProgress
             )
         }
