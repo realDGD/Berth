@@ -899,6 +899,13 @@ final class SFTPBrowserTests: XCTestCase {
     }
 
     func testMultiDownloadIndependentCancellation() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MultiCancel-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let urlA = tempDir.appendingPathComponent("fileA.bin")
+        let urlB = tempDir.appendingPathComponent("fileB.bin")
+
         let browser = SFTPBrowser {
             throw CocoaError(.fileNoSuchFile)
         }
@@ -914,6 +921,7 @@ final class SFTPBrowserTests: XCTestCase {
             if entry.name == "fileA.bin" {
                 startedA.fulfill()
                 try await Task.sleep(for: .milliseconds(300))
+                try Data("FILE A DATA".utf8).write(to: localURL)
                 completedA.fulfill()
                 return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 100)
             } else {
@@ -928,8 +936,8 @@ final class SFTPBrowserTests: XCTestCase {
             }
         }
 
-        let taskA = Task { await browser.download(entryA, to: URL(fileURLWithPath: "/tmp/a")) }
-        let taskB = Task { await browser.download(entryB, to: URL(fileURLWithPath: "/tmp/b")) }
+        let taskA = Task { await browser.download(entryA, to: urlA) }
+        let taskB = Task { await browser.download(entryB, to: urlB) }
 
         await fulfillment(of: [startedA, startedB], timeout: 2.0)
         XCTAssertEqual(browser.transfers.count, 2)
@@ -947,6 +955,8 @@ final class SFTPBrowserTests: XCTestCase {
         if case .failed = browser.state {
             XCTFail("Neither cancelled B nor completed A should put browser in failed state")
         }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: urlA.path), "Completed transfer A must commit to final URL")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: urlB.path), "Cancelled transfer B must not leave file at final URL")
     }
 
     func testCancellationPropagationFromOuterTask() async throws {
