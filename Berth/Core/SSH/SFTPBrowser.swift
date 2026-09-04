@@ -375,12 +375,22 @@ final class SFTPBrowser {
 
     func download(_ entry: Entry, to localURL: URL) async {
         do {
-            try await performDownload(
-                entry,
-                remoteDirectory: path,
-                to: localURL,
-                externalProgress: nil
+            let tx = try DownloadDestinationTransaction.begin(
+                finalURL: localURL,
+                isDirectory: entry.isDirectory
             )
+            do {
+                try await performDownload(
+                    entry,
+                    remoteDirectory: path,
+                    to: tx.workingURL,
+                    externalProgress: nil
+                )
+                try tx.commit()
+            } catch {
+                tx.discard()
+                throw error
+            }
         } catch is CancellationError {
             // 用户主动取消, 不改变 state 为 .failed
         } catch where (error as? CocoaError)?.code == .userCancelled {
