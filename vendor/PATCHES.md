@@ -174,12 +174,23 @@ handle，再发送一次 CLOSE，避免并发清理重复发送。上述每个 v
 `[Berth patch]` 标记，位置为 `Sources/Citadel/SFTP/Client/SFTPFile.swift` 及
 `Sources/Citadel/SFTP/Client/SFTPClient.swift` 的构造调用。
 
-## 补丁:PTY / TTY 退出时清理 channel.close 不覆盖业务结果
+## 补丁:PTY / TTY 退出时区分正常退出与传输拆除 (Clean Exit vs Transport Teardown)
 
-**动机**:
-Citadel 的 `withPTY` 与 `withTTY` 在业务闭包 `perform` 执行完毕后调用 `channel.close()` 进行通道清理。当远端 shell 正常 exit 时，远端已先发送 EOF / exit-status / CHANNEL_CLOSE，此时 NIOSSH 会让后续的重复 close 抛出 `ChannelError.alreadyClosed`。原逻辑直接把该 cleanup 错误抛出，导致上层（Berth）将正常的 shell exit 误判为 `transportFailure`，进而触发自动重连。同时，当 `perform` 自身发生异常时，原逻辑在 `catch` 块中调用 `try await close()`，若 `close()` 失败会直接覆盖 `perform` 的原始错误。
+**动机与基线**:
+- 基线：Citadel 0.12.0
+- 修改文件：`vendor/Citadel/Sources/Citadel/TTY/Client/TTY.swift`
+- 原始问题：
+  1. Citadel 的 `withPTY` 与 `withTTY` 在业务闭包 `perform` 执行完毕后调用 `channel.close()` 进行通道清理。当远端 shell 正常 exit 时，远端已先发送 EOF / exit-status / CHANNEL_CLOSE，此时 NIOSSH 会让后续的重复 close 抛出 `ChannelError.alreadyClosed`。原逻辑直接把该 cleanup 错误抛出，导致上层（Berth）将正常的 shell exit 误判为 `transportFailure`，进而触发自动重连。
+  2. 当 `perform` 自身发生异常时，原逻辑在 `catch` 块中调用 `try await close()`，若 `close()` 失败会直接覆盖 `perform` 的原始错误。
+  3. **更深层的传输拆除漏洞**：当网络断开或服务端异常关闭（例如 Wi-Fi 断开、sshd 进程被 kill、TCP reset）时，底层 child channel 销毁触发 `handlerRemoved`，产生 `.eof(nil)`。在未收到远端 `exit-status` 或 `exit-signal` 的情况下，原 stream 逻辑将其当成正常流结束直接 `finish()`，导致 `perform` 正常返回，cleanup close 捕获 `alreadyClosed` 后被吸收，最终整个 `withPTY` 返回 `error == nil`，致使 Berth 误判为 `cleanShellExit` 而错误关闭终端 tab。
 
 **Patch 行为**:
-- `perform` 正常完成后的清理忽略 `ChannelError.alreadyClosed` 和 `ChannelError.eof`，视作正常关闭，保持业务成功结果。
-- `perform` 抛出异常进入 `catch` 时，清理采用 best-effort（`try? await channel.close()`），确保原始业务错误（如 `tcpShutdown` 或其他 I/O 错误）原样向外抛出，不被覆盖。
+- **事件捕获**：`ExecCommandHandler` 同时捕获 `SSHChannelRequestEvent.ExitStatus` 与 `SSHChannelRequestEvent.ExitSignal`。
+- **状态机判断**：新增 `CommandStreamTerminationState` 结构：
+  - 交互式 PTY/TTY 会话中，只有在收到明确退出证据（`exit-status` 或 `exit-signal`）后，EOF 才能以 clean finish 结束。
+  - 若在未收到任何退出证据时收到 handler 移除引发的 `eof(nil)`，判定为异常传输拆除（Transport Teardown），向流抛出 `ChannelError.eof`，确保上层将其归类为 `transportFailure`。
+- **清理语义**：
+  - `perform` 正常完成后的清理忽略 `ChannelError.alreadyClosed` 和 `ChannelError.eof`，视作正常关闭，保持业务成功结果。
+  - `perform` 抛出异常进入 `catch` 时，清理采用 best-effort（`try? await channel.close()`），确保原始业务错误（如 `tcpShutdown`、`ChannelError.eof` 或其他 I/O 错误）原样向外抛出，绝不被覆盖。
+- **统一生命周期**：抽取 `SSHClient.executeTTYLifecycle`，供 `withPTY`、`withTTY` 以及单元测试直接共用同一生产逻辑。
 - 源码位置：`vendor/Citadel/Sources/Citadel/TTY/Client/TTY.swift`，以 `[Berth patch]` 注释标记。

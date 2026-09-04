@@ -38,6 +38,9 @@ public struct ExecCommandStream {
             case .exit(let status):
                 stdout.finish(throwing: SSHClient.CommandFailed(exitCode: status))
                 stderr.finish(throwing: SSHClient.CommandFailed(exitCode: status))
+            case .exitSignal:
+                stdout.finish(throwing: SSHClient.CommandFailed(exitCode: 128))
+                stderr.finish(throwing: SSHClient.CommandFailed(exitCode: 128))
             }
         }
     }
@@ -100,6 +103,7 @@ final class ExecCommandHandler: ChannelDuplexHandler, Sendable {
         case stderr(ByteBuffer)
         case eof(Error?)
         case exit(Int)
+        case exitSignal(String)
     }
     
     typealias InboundIn = SSHChannelData
@@ -133,6 +137,8 @@ final class ExecCommandHandler: ChannelDuplexHandler, Sendable {
             onOutput(context.channel, .eof(CitadelError.channelFailure))
         case let status as SSHChannelRequestEvent.ExitStatus:
             onOutput(context.channel, .exit(status.exitStatus))
+        case let signal as SSHChannelRequestEvent.ExitSignal:
+            onOutput(context.channel, .exitSignal(signal.signalName))
         default:
             self.logger.debug("Received unknown channel event in command handler: \(event)")
             context.fireUserInboundEventTriggered(event)
@@ -262,6 +268,52 @@ extension SSHClient {
         ).output
     }
 
+    /// [Berth patch] 跟踪命令或会话流的终止状态。
+    /// 交互式 PTY/TTY 在未收到 exit-status/exit-signal 且 channel 异常关闭时，必须产生 transport error。
+    public struct CommandStreamTerminationState: Sendable, Equatable {
+        public let isInteractive: Bool
+        public var exitCode: Int?
+        public var exitSignal: String?
+
+        public init(isInteractive: Bool, exitCode: Int? = nil, exitSignal: String? = nil) {
+            self.isInteractive = isInteractive
+            self.exitCode = exitCode
+            self.exitSignal = exitSignal
+        }
+
+        public var hasExitEvidence: Bool {
+            exitCode != nil || exitSignal != nil
+        }
+
+        public func resolveTermination(error: Error?) -> Result<Void, Error> {
+            if let error {
+                return .failure(error)
+            }
+            if isInteractive {
+                if hasExitEvidence {
+                    return .success(())
+                } else {
+                    // 交互式 PTY/TTY 在未收到任何退出状态证据的情况下收到 EOF，
+                    // 说明底层连接被异常断开或通道被破坏，必须抛出 transport error，
+                    // 避免被上层误判为 cleanShellExit 导致终端窗口被误关。
+                    return .failure(ChannelError.eof)
+                }
+            } else {
+                if let exitCode {
+                    if exitCode != 0 {
+                        return .failure(SSHClient.CommandFailed(exitCode: exitCode))
+                    } else {
+                        return .success(())
+                    }
+                } else if exitSignal != nil {
+                    return .failure(SSHClient.CommandFailed(exitCode: 128))
+                } else {
+                    return .failure(ChannelError.eof)
+                }
+            }
+        }
+    }
+
     enum CommandMode {
         case pty(SSHChannelRequestEvent.PseudoTerminalRequest), tty(command: String?), command(String)
     }
@@ -274,6 +326,15 @@ extension SSHClient {
 
         let hasReceivedChannelSuccess = NIOLockedValueBox<Bool>(false)
         let exitCode = NIOLockedValueBox<Int?>(nil)
+        let exitSignal = NIOLockedValueBox<String?>(nil)
+
+        let isInteractive: Bool
+        switch mode {
+        case .pty, .tty(command: nil):
+            isInteractive = true
+        case .tty(command: .some), .command:
+            isInteractive = false
+        }
 
         let handler = ExecCommandHandler(logger: logger) { channel, output in
             switch output {
@@ -283,12 +344,16 @@ extension SSHClient {
                 streamContinuation.yield(.stderr(stderr))
             case .eof(let error):
                 self.logger.debug("EOF triggered, ending the command stream.")
-                if let error {
-                    streamContinuation.finish(throwing: error)
-                } else if let exitCode = exitCode.withLockedValue({ $0 }), exitCode != 0 {
-                    streamContinuation.finish(throwing: CommandFailed(exitCode: exitCode))
-                } else {
+                let state = CommandStreamTerminationState(
+                    isInteractive: isInteractive,
+                    exitCode: exitCode.withLockedValue({ $0 }),
+                    exitSignal: exitSignal.withLockedValue({ $0 })
+                )
+                switch state.resolveTermination(error: error) {
+                case .success:
                     streamContinuation.finish()
+                case .failure(let failureError):
+                    streamContinuation.finish(throwing: failureError)
                 }
             case .channelSuccess:
                 if case .tty(.some(let command)) = mode, !hasReceivedChannelSuccess.withLockedValue({ $0 }) {
@@ -302,6 +367,9 @@ extension SSHClient {
             case .exit(let status):
                 self.logger.debug("Process exited with status code \(status). Will await on EOF for correct exit")
                 exitCode.withLockedValue({ $0 = status })
+            case .exitSignal(let signal):
+                self.logger.debug("Process exited with signal \(signal). Will await on EOF for correct exit")
+                exitSignal.withLockedValue({ $0 = signal })
             }
         }
 
@@ -340,6 +408,46 @@ extension SSHClient {
         return (channel, stream)
     }
 
+    /// [Berth patch] 统一的 PTY/TTY 执行与清理生命周期。
+    /// 确保：
+    /// 1. perform 业务异常绝对优先，cleanup 失败绝不覆盖原始业务异常。
+    /// 2. 远端先行 clean close 导致的 alreadyClosed / eof 清理错误在正常退出时不抛出。
+    public static func executeTTYLifecycle(
+        perform: () async throws -> Void,
+        cleanupClose: () async throws -> Void
+    ) async throws {
+        do {
+            try await perform()
+            do {
+                try await cleanupClose()
+            } catch ChannelError.alreadyClosed, ChannelError.eof {
+                // [Berth patch] Remote already cleanly closed the channel; benign on clean exit
+            }
+        } catch {
+            // [Berth patch] Cleanup is best effort; do not let cleanup error override original error
+            try? await cleanupClose()
+            throw error
+        }
+    }
+
+    @available(macOS 15.0, *)
+    internal func runTTYSession(
+        channel: Channel,
+        output: AsyncThrowingStream<ExecCommandOutput, Error>,
+        perform: (_ inbound: TTYOutput, _ outbound: TTYStdinWriter) async throws -> Void
+    ) async throws {
+        let inbound = TTYOutput(sequence: output)
+        let outbound = TTYStdinWriter(channel: channel)
+        try await SSHClient.executeTTYLifecycle(
+            perform: {
+                try await perform(inbound, outbound)
+            },
+            cleanupClose: {
+                try await channel.close()
+            }
+        )
+    }
+
     /// Creates a pseudo-terminal (PTY) session and executes the provided closure with input/output streams
     /// - Parameters:
     ///   - request: PTY configuration parameters
@@ -356,20 +464,7 @@ extension SSHClient {
             environment: environment,
             mode: .pty(request)
         )
-
-        do {
-            let inbound = TTYOutput(sequence: output)
-            try await perform(inbound, TTYStdinWriter(channel: channel))
-            do {
-                try await channel.close()
-            } catch ChannelError.alreadyClosed, ChannelError.eof {
-                // [Berth patch] Remote already cleanly closed the channel; benign on clean exit
-            }
-        } catch {
-            // [Berth patch] Cleanup is best effort; do not let cleanup error override original error
-            try? await channel.close()
-            throw error
-        }
+        try await runTTYSession(channel: channel, output: output, perform: perform)
     }
 
     /// Creates a TTY session and executes the provided closure with input/output streams
@@ -406,20 +501,7 @@ extension SSHClient {
             environment: environment,
             mode: .tty(command: nil)
         )
-
-        do {
-            let inbound = TTYOutput(sequence: output)
-            try await perform(inbound, TTYStdinWriter(channel: channel))
-            do {
-                try await channel.close()
-            } catch ChannelError.alreadyClosed, ChannelError.eof {
-                // [Berth patch] Remote already cleanly closed the channel; benign on clean exit
-            }
-        } catch {
-            // [Berth patch] Cleanup is best effort; do not let cleanup error override original error
-            try? await channel.close()
-            throw error
-        }
+        try await runTTYSession(channel: channel, output: output, perform: perform)
     }
 
     /// Executes a command and returns separate stdout and stderr streams

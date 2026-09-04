@@ -1,6 +1,7 @@
 import XCTest
 import NIOCore
 import NIOSSH
+import Citadel
 @testable import Berth
 
 final class SessionTerminationClassifierTests: XCTestCase {
@@ -160,28 +161,11 @@ final class SessionTerminationClassifierTests: XCTestCase {
         XCTAssertEqual(SessionTerminationClassifier.categorize(error: err), .localShellExited)
     }
 
-    // MARK: - PTY Cleanup Error Preservation Tests (P1-2)
-
-    private func simulatePTYExecution(
-        perform: () async throws -> Void,
-        cleanupClose: () async throws -> Void
-    ) async throws {
-        do {
-            try await perform()
-            do {
-                try await cleanupClose()
-            } catch ChannelError.alreadyClosed, ChannelError.eof {
-                // Remote already cleanly closed; benign on clean exit
-            }
-        } catch {
-            try? await cleanupClose()
-            throw error
-        }
-    }
+    // MARK: - PTY Lifecycle & Termination State Machine Tests (M-02)
 
     func testPTYPerformSuccessAndCleanupSuccessYieldsCleanExit() async {
         do {
-            try await simulatePTYExecution(
+            try await SSHClient.executeTTYLifecycle(
                 perform: { /* clean exit */ },
                 cleanupClose: { /* channel.close() succeeds */ }
             )
@@ -198,7 +182,7 @@ final class SessionTerminationClassifierTests: XCTestCase {
 
     func testPTYPerformSuccessAndCleanupAlreadyClosedYieldsCleanExit() async {
         do {
-            try await simulatePTYExecution(
+            try await SSHClient.executeTTYLifecycle(
                 perform: { /* clean exit */ },
                 cleanupClose: { throw ChannelError.alreadyClosed }
             )
@@ -214,6 +198,33 @@ final class SessionTerminationClassifierTests: XCTestCase {
         }
     }
 
+    func testPTYPerformThrowsAlreadyClosedPreservesErrorAndYieldsTransportFailure() async {
+        var caught: Error?
+        do {
+            try await SSHClient.executeTTYLifecycle(
+                perform: { throw ChannelError.alreadyClosed },
+                cleanupClose: { throw ChannelError.alreadyClosed }
+            )
+            XCTFail("Should have thrown error")
+        } catch {
+            caught = error
+        }
+
+        guard let channelError = caught as? ChannelError, channelError == .alreadyClosed else {
+            XCTFail("Expected ChannelError.alreadyClosed, got \(String(describing: caught))")
+            return
+        }
+        let disposition = SessionTerminationClassifier.classify(
+            error: channelError,
+            everConnected: true,
+            userInitiated: false
+        )
+        guard case .transportFailure = disposition else {
+            XCTFail("Expected transportFailure, got \(disposition)")
+            return
+        }
+    }
+
     func testPTYPerformThrowsTcpShutdownAndCleanupAlreadyClosedPreservesTcpShutdown() async {
         struct MockTCPShutdownError: Error, CustomStringConvertible, Equatable {
             var description: String { "NIOSSHError.tcpShutdown" }
@@ -221,7 +232,7 @@ final class SessionTerminationClassifierTests: XCTestCase {
 
         var caught: Error?
         do {
-            try await simulatePTYExecution(
+            try await SSHClient.executeTTYLifecycle(
                 perform: { throw MockTCPShutdownError() },
                 cleanupClose: { throw ChannelError.alreadyClosed }
             )
@@ -248,7 +259,7 @@ final class SessionTerminationClassifierTests: XCTestCase {
 
         var caught: Error?
         do {
-            try await simulatePTYExecution(
+            try await SSHClient.executeTTYLifecycle(
                 perform: { throw CustomErrorA() },
                 cleanupClose: { throw CustomErrorB() }
             )
@@ -266,6 +277,82 @@ final class SessionTerminationClassifierTests: XCTestCase {
         guard case .transportFailure = disposition else {
             XCTFail("Expected transportFailure, got \(disposition)")
             return
+        }
+    }
+
+    // MARK: - CommandStreamTerminationState Regression Tests (M-02)
+
+    func testInteractiveTerminationStateWithExitStatusYieldsCleanFinish() {
+        let stateZero = SSHClient.CommandStreamTerminationState(isInteractive: true, exitCode: 0)
+        let resZero = stateZero.resolveTermination(error: nil)
+        XCTAssertNoThrow(try resZero.get())
+
+        let stateNonZero = SSHClient.CommandStreamTerminationState(isInteractive: true, exitCode: 1)
+        let resNonZero = stateNonZero.resolveTermination(error: nil)
+        XCTAssertNoThrow(try resNonZero.get())
+    }
+
+    func testInteractiveTerminationStateWithExitSignalYieldsCleanFinish() {
+        let stateSignal = SSHClient.CommandStreamTerminationState(isInteractive: true, exitSignal: "TERM")
+        let resSignal = stateSignal.resolveTermination(error: nil)
+        XCTAssertNoThrow(try resSignal.get())
+    }
+
+    func testInteractiveTerminationStateWithoutExitEvidenceYieldsTransportError() {
+        // Transport teardown: handler removed without exit evidence
+        let stateTeardown = SSHClient.CommandStreamTerminationState(isInteractive: true, exitCode: nil, exitSignal: nil)
+        let resTeardown = stateTeardown.resolveTermination(error: nil)
+        switch resTeardown {
+        case .success:
+            XCTFail("Must not succeed without exit evidence")
+        case .failure(let err):
+            guard let channelError = err as? ChannelError, channelError == .eof else {
+                XCTFail("Expected ChannelError.eof, got \(err)")
+                return
+            }
+            let disposition = SessionTerminationClassifier.classify(
+                error: channelError,
+                everConnected: true,
+                userInitiated: false
+            )
+            guard case .transportFailure = disposition else {
+                XCTFail("Expected transportFailure, got \(disposition)")
+                return
+            }
+        }
+    }
+
+    func testInteractiveTerminationStateWithOriginalErrorPreservesError() {
+        struct MockNetworkError: Error, Equatable {}
+        let state = SSHClient.CommandStreamTerminationState(isInteractive: true, exitCode: 0)
+        let res = state.resolveTermination(error: MockNetworkError())
+        switch res {
+        case .success:
+            XCTFail("Must fail when original error is present")
+        case .failure(let err):
+            XCTAssertTrue(err is MockNetworkError)
+        }
+    }
+
+    func testNonInteractiveTerminationStateResolutions() {
+        let successCommand = SSHClient.CommandStreamTerminationState(isInteractive: false, exitCode: 0)
+        XCTAssertNoThrow(try successCommand.resolveTermination(error: nil).get())
+
+        let failedCommand = SSHClient.CommandStreamTerminationState(isInteractive: false, exitCode: 2)
+        switch failedCommand.resolveTermination(error: nil) {
+        case .success:
+            XCTFail("Must fail with non-zero exit code")
+        case .failure(let err):
+            XCTAssertTrue(err is SSHClient.CommandFailed)
+            XCTAssertEqual((err as? SSHClient.CommandFailed)?.exitCode, 2)
+        }
+
+        let missingEvidenceCommand = SSHClient.CommandStreamTerminationState(isInteractive: false, exitCode: nil)
+        switch missingEvidenceCommand.resolveTermination(error: nil) {
+        case .success:
+            XCTFail("Must fail without exit code")
+        case .failure(let err):
+            XCTAssertEqual(err as? ChannelError, .eof)
         }
     }
 }
