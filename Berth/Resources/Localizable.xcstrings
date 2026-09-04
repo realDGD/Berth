@@ -5437,6 +5437,26 @@
         }
       }
     },
+    "服务器在文件下载完成前提前结束传输。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The server ended the transfer before the file download completed."
+          }
+        }
+      }
+    },
+    "服务器返回了无效的文件数据。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The server returned invalid file data."
+          }
+        }
+      }
+    },
     "服务器在握手阶段关闭了连接:多半是本机 IP 触发了 %@ 的连接频率限制": {
       "localizations": {
         "en": {
@@ -8023,6 +8043,46 @@
           "stringUnit": {
             "state": "translated",
             "value": "Remote %@:%@ → %@:%@"
+          }
+        }
+      }
+    },
+    "远端文件名不能为空。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The remote filename cannot be empty."
+          }
+        }
+      }
+    },
+    "远端文件名包含不安全的路径分量。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The remote filename contains an unsafe path component."
+          }
+        }
+      }
+    },
+    "远端文件名包含本地文件系统不支持的字符。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The remote filename contains characters unsupported by the local file system."
+          }
+        }
+      }
+    },
+    "远端文件的目标路径超出下载目录。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The destination path for the remote file is outside the download directory."
           }
         }
       }

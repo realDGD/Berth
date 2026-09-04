@@ -834,6 +834,10 @@ final class SFTPBrowser {
     }
 
     private func friendly(_ error: Error) -> String {
+        if let localizedError = error as? LocalizedError,
+           let description = localizedError.errorDescription {
+            return description
+        }
         let raw = String(describing: error)
         if raw.localizedCaseInsensitiveContains("permission") { return String(localized: "权限不足") }
         if raw.localizedCaseInsensitiveContains("noSuchFile") || raw.localizedCaseInsensitiveContains("no such") {

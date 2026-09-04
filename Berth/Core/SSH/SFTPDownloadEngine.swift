@@ -54,9 +54,18 @@ enum SFTPDownloadEngine {
         let isFinished: Bool
     }
 
-    enum Error: Swift.Error, Equatable {
+    enum Error: Swift.Error, LocalizedError, Equatable {
         case earlyEOF(offset: UInt64, expectedSize: UInt64)
         case invalidReadLength(requested: UInt32, received: Int)
+
+        var errorDescription: String? {
+            switch self {
+            case .earlyEOF:
+                return String(localized: "服务器在文件下载完成前提前结束传输。")
+            case .invalidReadLength:
+                return String(localized: "服务器返回了无效的文件数据。")
+            }
+        }
     }
 
     /// Internal coordination primitive for exercising the cancellation boundary between a
@@ -395,7 +404,7 @@ enum SFTPDownloadEngine {
             }
             isClosed = true
             streamContinuation.yield(ProgressUpdate(
-                completedBytes: totalBytes ?? completedBytes,
+                completedBytes: completedBytes,
                 totalBytes: totalBytes,
                 isFinished: true
             ))
@@ -554,6 +563,7 @@ enum SFTPDownloadEngine {
                 for entry in result.entries.sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending }) {
                     try Task.checkCancellation()
                     guard entry.name != ".", entry.name != ".." else { continue }
+                    guard (try? LocalPathComponentValidator.validateComponent(entry.name)) != nil else { continue }
                     let childPath = appendRemotePath(result.pending.remotePath, entry.name)
                     let childComponents = result.pending.relativeComponents + [entry.name]
                     switch entry.kind {
@@ -663,9 +673,11 @@ enum SFTPDownloadEngine {
                 // root sentinel; localRoot 已经在此前创建, 跳过 validator 拼接
                 continue
             }
-            let destination = components.reduce(localRoot) {
-                $0.appendingPathComponent($1, isDirectory: true)
-            }
+            let destination = try LocalPathComponentValidator.safeURL(
+                in: localRoot,
+                components: components,
+                isDirectory: true
+            )
             try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         }
     }
@@ -727,9 +739,11 @@ enum SFTPDownloadEngine {
                     let item = files[nextIndex]
                     nextIndex += 1
                     active += 1
-                    let localURL = item.relativeComponents.reduce(localRoot) {
-                        $0.appendingPathComponent($1, isDirectory: false)
-                    }
+                    let localURL = try LocalPathComponentValidator.safeURL(
+                        in: localRoot,
+                        components: item.relativeComponents,
+                        isDirectory: false
+                    )
                     group.addTask {
                         try await downloadOpenedFile(
                             remotePath: item.remotePath,

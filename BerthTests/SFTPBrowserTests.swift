@@ -814,4 +814,32 @@ final class SFTPBrowserTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: tempRoot.appendingPathComponent("subfolder").path))
     }
 
+    func testDirectoryMaterializationRejectsMaliciousTraversal() {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MaterializeMaliciousTest-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        XCTAssertThrowsError(
+            try SFTPDownloadEngine.materializeDirectories([[], [".."]], localRoot: tempRoot)
+        )
+    }
+
+    func testDirectoryPlanSkipsUnsafeRemoteNames() async throws {
+        let budget = SFTPDownloadEngine.TransferBudget(requestLimit: 8, handleLimit: 2)
+        let entries = [
+            SFTPDownloadEngine.DirectoryEntry(name: "safe.txt", kind: .file, size: 100),
+            SFTPDownloadEngine.DirectoryEntry(name: "../escape.txt", kind: .file, size: 100),
+            SFTPDownloadEngine.DirectoryEntry(name: "evil/nested.txt", kind: .file, size: 100),
+            SFTPDownloadEngine.DirectoryEntry(name: "null\0byte.txt", kind: .file, size: 100)
+        ]
+
+        let plan = try await SFTPDownloadEngine.makeDirectoryDownloadPlan(
+            remoteRoot: "/remote/test",
+            budget: budget,
+            configuration: .init()
+        ) { _ in entries }
+
+        XCTAssertEqual(plan.files.map(\.relativeComponents), [["safe.txt"]])
+    }
+
 }
