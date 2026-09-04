@@ -33,38 +33,39 @@ enum SFTPDragProvider {
         ) { completion in
             let total = !entry.isDirectory && entry.size > 0 ? Int64(clamping: entry.size) : 1
             let progress = Progress(totalUnitCount: total)
-            let task = Task { @MainActor in
-                let temporaryDirectory = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("Berth-Drag-\(UUID().uuidString)", isDirectory: true)
-                let localURL = temporaryDirectory.appendingPathComponent(
-                    entry.name,
-                    isDirectory: entry.isDirectory
-                )
+            let task = Task {
+                let lease: SFTPDragStagingLease
+                do {
+                    lease = try await SFTPDragStagingStore.shared.create(
+                        named: entry.name,
+                        isDirectory: entry.isDirectory
+                    )
+                } catch {
+                    completion(nil, false, error)
+                    return
+                }
 
                 do {
                     guard let browser else {
                         throw CocoaError(.fileNoSuchFile)
                     }
-                    try FileManager.default.createDirectory(
-                        at: temporaryDirectory,
-                        withIntermediateDirectories: true
-                    )
                     try await browser.downloadForDrag(
                         entry,
                         remoteDirectory: remoteDirectory,
-                        to: localURL,
+                        to: lease.payloadURL,
                         progress: progress
                     )
-                    completion(localURL, false, nil)
+                    await SFTPDragStagingStore.shared.markDelivered(lease)
+                    completion(lease.payloadURL, false, nil)
                     // 文件表示的接收方可能在 completion 返回后才开始复制。给 Finder 足够的
-                    // 取用时间,再清理由 Berth 创建的临时副本;系统临时目录也会兜底清理。
+                    // 取用宽限期, 再清理由 Berth 创建的临时副本; 启动/新拖拽时也会兜底 sweep。
                     Task.detached {
                         try? await Task.sleep(for: .seconds(30 * 60))
-                        try? FileManager.default.removeItem(at: temporaryDirectory)
+                        await SFTPDragStagingStore.shared.discardIfDelivered(lease)
                     }
                 } catch {
                     completion(nil, false, error)
-                    try? FileManager.default.removeItem(at: temporaryDirectory)
+                    await SFTPDragStagingStore.shared.discard(lease)
                 }
             }
             progress.cancellationHandler = { task.cancel() }
