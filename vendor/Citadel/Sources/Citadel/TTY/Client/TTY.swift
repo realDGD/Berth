@@ -38,6 +38,7 @@ public struct ExecCommandStream {
             case .exit(let status):
                 stdout.finish(throwing: SSHClient.CommandFailed(exitCode: status))
                 stderr.finish(throwing: SSHClient.CommandFailed(exitCode: status))
+            // [Berth patch] Preserve RFC 4254 exit-signal as explicit termination evidence.
             case .exitSignal:
                 stdout.finish(throwing: SSHClient.CommandFailed(exitCode: 128))
                 stderr.finish(throwing: SSHClient.CommandFailed(exitCode: 128))
@@ -103,6 +104,7 @@ final class ExecCommandHandler: ChannelDuplexHandler, Sendable {
         case stderr(ByteBuffer)
         case eof(Error?)
         case exit(Int)
+        // [Berth patch] Forward exit-signal instead of discarding it as an unknown event.
         case exitSignal(String)
     }
     
@@ -137,6 +139,7 @@ final class ExecCommandHandler: ChannelDuplexHandler, Sendable {
             onOutput(context.channel, .eof(CitadelError.channelFailure))
         case let status as SSHChannelRequestEvent.ExitStatus:
             onOutput(context.channel, .exit(status.exitStatus))
+        // [Berth patch] Capture RFC 4254 exit-signal for conservative termination classification.
         case let signal as SSHChannelRequestEvent.ExitSignal:
             onOutput(context.channel, .exitSignal(signal.signalName))
         default:
