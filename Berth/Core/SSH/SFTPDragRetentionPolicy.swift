@@ -4,6 +4,8 @@ import Foundation
 /// 注意: 由于 NSItemProvider 无法感知 Finder 等消费方何时真正完成对 staging 文件的读取与复制,
 /// 此处计算的保留期仅为根据载荷大小推断的预估消费窗口 (Estimated Consumption Window),
 /// 绝不代表消费方必定已复制完成。
+/// 为避免 Finder 仍在复制超大载荷时删除源数据，该窗口不设置固定上限；已交付数据可能保留数天，
+/// 但仍会依据 payloadBytes 得到有限的回收时间。
 public struct SFTPDragRetentionPolicy: Sendable, Equatable {
     public static let minimumGracePeriod: TimeInterval = 30 * 60 // 30 分钟基线
     public static let estimatedBytesPerSecond: Double = 2 * 1024 * 1024 // 假定慢速目标至少 2 MiB/s

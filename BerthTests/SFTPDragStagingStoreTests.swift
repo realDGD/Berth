@@ -13,9 +13,7 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         try FileManager.default.createDirectory(at: tempDirectoryURL, withIntermediateDirectories: true)
         store = SFTPDragStagingStore(
             baseDirectory: tempDirectoryURL,
-            deliveredGracePeriod: 1800,  // 30 mins
             interruptedGracePeriod: 3600, // 1 hour
-            absoluteCeiling: 86400,      // 24 hours
             legacyGracePeriod: 86400,    // 24 hours
             minimumSweepInterval: 60     // 60 seconds
         )
@@ -52,6 +50,21 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         } catch {
             // Expected
         }
+    }
+
+    func testCreateRemovesRootWhenInitialMarkerWriteFails() async throws {
+        let failingStore = SFTPDragStagingStore(
+            baseDirectory: tempDirectoryURL,
+            markerWriter: { _, _ in throw CocoaError(.fileWriteNoPermission) }
+        )
+
+        do {
+            _ = try await failingStore.create(named: "marker-failure.txt", isDirectory: false)
+            XCTFail("create must throw when the initial marker write fails")
+        } catch {
+            // Expected.
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: tempDirectoryURL.path), [])
     }
 
     func testDiscardImmediatelyRemovesStagingRoot() async throws {
@@ -304,7 +317,6 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         let customStore = SFTPDragStagingStore(
             baseDirectory: tempDirectoryURL,
             interruptedGracePeriod: 3600,   // 1 hour
-            absoluteCeiling: 86400,         // 24 hours
             processLivenessChecker: { _ in true } // foreign owner process is STILL ALIVE
         )
 
@@ -338,7 +350,7 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         XCTAssertEqual(sweep2h.reclaimedCount, 0, "Foreign active lease with live owner must be kept at 2 hours")
         XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
 
-        // 48 hours later (exceeds absoluteCeiling 24h): owner alive -> KEEP
+        // 48 hours later: owner alive -> KEEP
         let sweep48h = try await customStore.sweepStale(now: t0.addingTimeInterval(48 * 3600))
         XCTAssertEqual(sweep48h.reclaimedCount, 0, "Foreign active lease with live owner must be kept even at 48 hours")
         XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))

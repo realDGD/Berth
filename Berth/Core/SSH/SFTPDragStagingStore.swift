@@ -107,9 +107,7 @@ public actor SFTPDragStagingStore {
     private var activeLeases: [UUID: SFTPDragStagingLease] = [:]
     private var lastSweepDate: Date?
 
-    public let deliveredGracePeriod: TimeInterval
     public let interruptedGracePeriod: TimeInterval
-    public let absoluteCeiling: TimeInterval
     public let legacyGracePeriod: TimeInterval
     public let minimumSweepInterval: TimeInterval
     private let processLivenessChecker: ProcessLivenessChecker
@@ -117,18 +115,14 @@ public actor SFTPDragStagingStore {
 
     public init(
         baseDirectory: URL = FileManager.default.temporaryDirectory,
-        deliveredGracePeriod: TimeInterval = 30 * 60,
         interruptedGracePeriod: TimeInterval = 60 * 60,
-        absoluteCeiling: TimeInterval = 24 * 3600,
         legacyGracePeriod: TimeInterval = 24 * 3600,
         minimumSweepInterval: TimeInterval = 60,
         processLivenessChecker: @escaping ProcessLivenessChecker = SFTPDragStagingStore.defaultProcessLivenessChecker,
         markerWriter: @escaping MarkerWriter = SFTPDragStagingStore.defaultMarkerWriter
     ) {
         self.baseDirectory = baseDirectory
-        self.deliveredGracePeriod = deliveredGracePeriod
         self.interruptedGracePeriod = interruptedGracePeriod
-        self.absoluteCeiling = absoluteCeiling
         self.legacyGracePeriod = legacyGracePeriod
         self.minimumSweepInterval = minimumSweepInterval
         self.processLivenessChecker = processLivenessChecker
@@ -153,20 +147,27 @@ public actor SFTPDragStagingStore {
         let payloadURL = try LocalPathComponentValidator.safeURL(in: rootURL, component: named, isDirectory: isDirectory)
 
         try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
-        let metadata = StagingMarkerMetadata(
-            schemaVersion: 1,
-            id: id,
-            pid: ProcessInfo.processInfo.processIdentifier,
-            createdAt: now,
-            deliveredAt: nil,
-            payloadName: named,
-            isDirectory: isDirectory
-        )
-        let markerURL = rootURL.appendingPathComponent(Self.markerFilename, isDirectory: false)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(metadata)
-        try markerWriter(data, markerURL)
+        do {
+            let metadata = StagingMarkerMetadata(
+                schemaVersion: 1,
+                id: id,
+                pid: ProcessInfo.processInfo.processIdentifier,
+                createdAt: now,
+                deliveredAt: nil,
+                payloadName: named,
+                isDirectory: isDirectory
+            )
+            let markerURL = rootURL.appendingPathComponent(Self.markerFilename, isDirectory: false)
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(metadata)
+            try markerWriter(data, markerURL)
+        } catch {
+            // The root is private to this just-created lease. A markerless root would otherwise
+            // survive until the much longer legacy sweep window.
+            try? fileManager.removeItem(at: rootURL)
+            throw error
+        }
 
         let lease = SFTPDragStagingLease(id: id, rootURL: rootURL, payloadURL: payloadURL, createdAt: now)
         activeLeases[id] = lease
