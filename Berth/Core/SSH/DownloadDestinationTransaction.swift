@@ -285,10 +285,12 @@ actor DownloadDestinationTransactionWorker {
     static let shared = DownloadDestinationTransactionWorker()
 
     func begin(finalURL: URL, isDirectory: Bool) throws -> DownloadDestinationTransaction {
+        try Task.checkCancellation()
         try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: isDirectory)
     }
 
     func commit(_ transaction: DownloadDestinationTransaction) throws {
+        try Task.checkCancellation()
         try transaction.commit()
     }
 
