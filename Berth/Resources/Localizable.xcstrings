@@ -1635,6 +1635,16 @@
         }
       }
     },
+    "下载临时工作项不存在: %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The temporary download item is missing: %@"
+          }
+        }
+      }
+    },
     "不使用": {
       "localizations": {
         "en": {
@@ -6437,12 +6447,32 @@
         }
       }
     },
+    "目标父目录无效: %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Invalid destination parent directory: %@"
+          }
+        }
+      }
+    },
     "目标目录 %@ 已存在:%@": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Destination %@ already contains: %@"
+          }
+        }
+      }
+    },
+    "目标目录已存在: %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Destination folder already exists: %@"
           }
         }
       }
