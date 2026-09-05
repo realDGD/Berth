@@ -417,10 +417,10 @@ final class SFTPBrowser {
         // The top-level name is server-controlled too. Validate it before opening a handle or
         // touching the caller-provided local destination; recursive entries are validated by the
         // download engine while it builds the directory plan.
+        try LocalPathComponentValidator.validateComponent(entry.name)
         if !isCustomDownloadExecutor {
             guard sftp != nil else { throw TransferError.sftpUnavailable }
         }
-        try LocalPathComponentValidator.validateComponent(entry.name)
 
         let remotePath = join(remoteDirectory, entry.name)
         let transferID = beginTransfer(
