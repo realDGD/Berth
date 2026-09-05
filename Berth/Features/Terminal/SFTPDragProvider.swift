@@ -79,7 +79,7 @@ enum SFTPDragProvider {
     }
 
     /// 判断是否为用户主动发起的取消操作 (覆盖 Swift.CancellationError, CocoaError(.userCancelled), Task.isCancelled)
-    static func isCancellation(_ error: Error) -> Bool {
+    nonisolated static func isCancellation(_ error: Error) -> Bool {
         if error is CancellationError {
             return true
         }
@@ -97,7 +97,7 @@ enum SFTPDragProvider {
     }
 
     /// 将取消类错误标准化为 CocoaError(.userCancelled), 其余真实错误原样保留
-    static func normalizedCancellationError(_ error: Error) -> Error {
+    nonisolated static func normalizedCancellationError(_ error: Error) -> Error {
         if isCancellation(error) {
             return CocoaError(.userCancelled)
         }
