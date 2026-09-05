@@ -286,7 +286,7 @@ actor DownloadDestinationTransactionWorker {
 
     func begin(finalURL: URL, isDirectory: Bool) throws -> DownloadDestinationTransaction {
         try Task.checkCancellation()
-        try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: isDirectory)
+        return try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: isDirectory)
     }
 
     func commit(_ transaction: DownloadDestinationTransaction) throws {
