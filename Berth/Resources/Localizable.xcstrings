@@ -2966,6 +2966,16 @@
         }
       }
     },
+    "取消传输": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cancel Transfer"
+          }
+        }
+      }
+    },
     "取消收藏此目录": {
       "localizations": {
         "en": {
