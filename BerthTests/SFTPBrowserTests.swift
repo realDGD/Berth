@@ -842,4 +842,36 @@ final class SFTPBrowserTests: XCTestCase {
         XCTAssertEqual(plan.files.map(\.relativeComponents), [["safe.txt"]])
     }
 
+    @MainActor
+    func testDragDownloadRejectsUnsafeTopLevelNameBeforeSFTPAccess() async {
+        let browser = SFTPBrowser {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let entry = SFTPBrowser.Entry(
+            name: "../escape.txt",
+            isDirectory: false,
+            isSymlink: false,
+            size: 1,
+            sizeIsKnown: true,
+            modified: nil
+        )
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("must-not-be-created-\(UUID().uuidString)")
+
+        do {
+            try await browser.downloadForDrag(
+                entry,
+                remoteDirectory: "/remote",
+                to: destination,
+                progress: Progress(totalUnitCount: 1)
+            )
+            XCTFail("unsafe top-level SFTP name must be rejected")
+        } catch let error as LocalPathComponentValidator.ValidationError {
+            XCTAssertEqual(error, .invalidCharacters(component: "../escape.txt"))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
 }

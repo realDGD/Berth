@@ -307,6 +307,10 @@ final class SFTPBrowser {
         to localURL: URL,
         externalProgress: Progress?
     ) async throws {
+        // The top-level name is server-controlled too. Validate it before opening a handle or
+        // touching the caller-provided local destination; recursive entries are validated by the
+        // download engine while it builds the directory plan.
+        try LocalPathComponentValidator.validateComponent(entry.name)
         guard let sftp else { throw TransferError.sftpUnavailable }
 
         let remotePath = join(remoteDirectory, entry.name)
