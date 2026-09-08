@@ -949,16 +949,17 @@ final class TerminalSession: Identifiable {
             terminalPixelHeight: 0,
             terminalModes: .init([:])
         )
-        // 服务器登录环境不带 LANG 时,vim 等按 nl_langinfo(CODESET) 猜编码会退回 C/POSIX,
-        // 把文件里的 UTF-8 多字节序列拆成单字节乱码。这里显式声明 UTF-8 locale(不依赖
-        // SendEnv/客户端本地 shell 环境);C.UTF-8 是 glibc 内置、几乎所有现代发行版都有的
-        // 字符集,不需要 locale-gen 也不影响 `Core/SSH/ServerMetrics.swift` 里对 C 风格数字/
-        // 日期格式的解析。服务器 sshd_config 没 `AcceptEnv LANG LC_*` 时请求会被静默丢弃,
-        // 不影响连接(wantReply=false,且 Citadel 不等回执)。
-        let localeEnvironment: [SSHChannelRequestEvent.EnvironmentRequest] = [
-            .init(wantReply: false, name: "LANG", value: "C.UTF-8"),
-            .init(wantReply: false, name: "LC_ALL", value: "C.UTF-8"),
-        ]
+        // 不假设服务器安装了 C.UTF-8 (CentOS 7 等旧系统可能没有)。
+        // 仅在缺少 UTF-8 字符环境时补 LC_CTYPE,保留 LANG/LC_ALL 和其他类别。
+        let localeCommand = "sh -c \(Self.shellQuote(RemoteLocale.probeScript))"
+        let characterLocale = await RemoteLocale.detect {
+            let output = try await client.executeCommand(localeCommand, maxResponseSize: 64 * 1024)
+            return String(buffer: output)
+        }
+        try Task.checkCancellation()
+        let localeEnvironment: [SSHChannelRequestEvent.EnvironmentRequest] = characterLocale.map {
+            [.init(wantReply: false, name: "LC_CTYPE", value: $0)]
+        } ?? []
 
         try await client.withPTY(ptyRequest, environment: localeEnvironment) { inbound, outbound in
             let (stream, continuation) = AsyncStream.makeStream(of: StdinEvent.self)

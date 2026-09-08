@@ -181,6 +181,13 @@ Citadel 自带 `DiffieHellmanGroup14Sha1/Sha256` 与 `AES128CTR` 实现(Berth �
 本地 vendor 已脱离 SPM 版本管理。若要升级,需重新 vendor 对应版本并重放上述 `[Berth patch]`
 改动(`grep -rn "\[Berth patch\]" vendor/` 可列出全部补丁点)。
 
+## 补丁:取消命令探测时释放子通道
+
+`TTY/Client/TTY.swift` 的 `_executeCommandStream` 在流消费者取消时关闭当前 child
+channel,不关闭共享 SSH 连接。通道创建期间的 NIO future 不响应 Swift Task 取消,
+因此创建返回后再次检查取消状态,及时关闭迟到通道,不继续发送命令。
+用于 locale 探测超时降级,避免探测阻塞终端或遗留远端命令通道。源码带 `[Berth patch]` 标记。
+
 ## 补丁: SFTP listDirectory 关闭 OPENDIR handle
 
 `SFTPClient.listDirectory(atPath:)` 原先在读取完目录后直接返回,没有发送

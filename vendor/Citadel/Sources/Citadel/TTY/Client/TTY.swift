@@ -392,6 +392,21 @@ extension SSHClient {
             return createChannel.futureResult
         }.get()
 
+        // [Berth patch] A cancelled command consumer (e.g. a timed-out locale probe) must
+        // release its child channel without closing the shared SSH transport.
+        streamContinuation.onTermination = { termination in
+            if case .cancelled = termination {
+                channel.close(promise: nil)
+            }
+        }
+
+        // Channel creation awaits a NIO future which does not react to Task cancellation.
+        // A late-created channel must be closed before sending any command or environment.
+        if Task.isCancelled {
+            channel.close(promise: nil)
+            throw CancellationError()
+        }
+
         for env in environment {
             try await channel.triggerUserOutboundEvent(env)
         }
