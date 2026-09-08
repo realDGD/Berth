@@ -388,6 +388,10 @@ final class SFTPBrowser {
 
     func download(_ entry: Entry, to localURL: URL) async {
         do {
+            // Freeze the selected remote directory before the first suspension. Destination
+            // preparation performs file-system work on another actor; the user may navigate the
+            // SFTP panel while it is running, but that must not retarget this download.
+            let remoteDirectory = path
             let worker = DownloadDestinationTransactionWorker.shared
             let tx = try await worker.begin(
                 finalURL: localURL,
@@ -397,7 +401,7 @@ final class SFTPBrowser {
                 try Task.checkCancellation()
                 try await performDownload(
                     entry,
-                    remoteDirectory: path,
+                    remoteDirectory: remoteDirectory,
                     to: tx.workingURL,
                     externalProgress: nil
                 )

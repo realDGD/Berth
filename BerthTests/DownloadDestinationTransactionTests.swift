@@ -343,27 +343,34 @@ final class DownloadDestinationTransactionTests: XCTestCase {
         tx.discard()
     }
 
-    func testSweepRemovesAbandonedFileTransaction() throws {
+    func testSweepRetainsRecentAbandonedFileUntilGraceExpires() throws {
+        let createdAt = Date()
         let registry = DownloadTransactionRegistry(
-            baseDirectory: tempDirectoryURL.appendingPathComponent("orphan-registry", isDirectory: true)
+            baseDirectory: tempDirectoryURL.appendingPathComponent("orphan-registry", isDirectory: true),
+            orphanGracePeriod: 3600
         )
         let finalURL = tempDirectoryURL.appendingPathComponent("orphan.bin")
         let tx = try DownloadDestinationTransaction.begin(
             finalURL: finalURL,
             isDirectory: false,
+            createdAt: createdAt,
             registry: registry
         )
         try "PARTIAL".write(to: tx.workingURL, atomically: true, encoding: .utf8)
         tx.abandonWithoutCleanup()
 
-        let result = try registry.sweepOrphans()
+        let recentResult = try registry.sweepOrphans(now: createdAt.addingTimeInterval(3599))
+        XCTAssertEqual(recentResult.reclaimedCount, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tx.workingURL.path))
 
-        XCTAssertEqual(result.reclaimedCount, 1)
+        let expiredResult = try registry.sweepOrphans(now: createdAt.addingTimeInterval(3601))
+        XCTAssertEqual(expiredResult.reclaimedCount, 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: finalURL.path))
     }
 
     func testSweepRemovesAbandonedDirectoryTransaction() throws {
+        let now = Date()
         let registry = DownloadTransactionRegistry(
             baseDirectory: tempDirectoryURL.appendingPathComponent("orphan-directory-registry", isDirectory: true)
         )
@@ -371,6 +378,7 @@ final class DownloadDestinationTransactionTests: XCTestCase {
         let tx = try DownloadDestinationTransaction.begin(
             finalURL: finalURL,
             isDirectory: true,
+            createdAt: now.addingTimeInterval(-(DownloadTransactionRegistry.defaultOrphanGracePeriod + 1)),
             registry: registry
         )
         try "PARTIAL".write(
@@ -380,7 +388,7 @@ final class DownloadDestinationTransactionTests: XCTestCase {
         )
         tx.abandonWithoutCleanup()
 
-        let result = try registry.sweepOrphans()
+        let result = try registry.sweepOrphans(now: now)
 
         XCTAssertEqual(result.reclaimedCount, 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))

@@ -918,7 +918,7 @@ final class SFTPBrowserTests: XCTestCase {
         let browser = SFTPBrowser { throw CocoaError(.fileNoSuchFile) }
         let transferStarted = expectation(description: "remote transfer must not start")
         transferStarted.isInverted = true
-        browser.downloadExecutor = { _, _, _, _, _, _, _, _ in
+        browser.downloadExecutor = { _ in
             transferStarted.fulfill()
             return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 0)
         }
@@ -1020,8 +1020,8 @@ final class SFTPBrowserTests: XCTestCase {
         )
         let workingReady = expectation(description: "working file ready")
 
-        browser.downloadExecutor = { _, _, localURL, _, _, _, _, _ in
-            try Data("NEW DATA".utf8).write(to: localURL)
+        browser.downloadExecutor = { request in
+            try Data("NEW DATA".utf8).write(to: request.localURL)
             workingReady.fulfill()
             // 模拟底层在最终 CLOSE 后忽略取消并正常返回；Task cancellation 本身不会强制 throw。
             while !Task.isCancelled {
@@ -1071,7 +1071,7 @@ final class SFTPBrowserTests: XCTestCase {
             if request.entry.name == "fileA.bin" {
                 startedA.fulfill()
                 try await Task.sleep(for: .milliseconds(300))
-                try Data("FILE A DATA".utf8).write(to: localURL)
+                try Data("FILE A DATA".utf8).write(to: request.localURL)
                 completedA.fulfill()
                 return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 100)
             } else {

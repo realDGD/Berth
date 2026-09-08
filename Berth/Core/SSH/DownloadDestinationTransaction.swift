@@ -13,6 +13,37 @@ private struct DownloadTransactionManifest: Codable, Sendable {
     let finalPath: String
     let workingPath: String
     let isDirectory: Bool
+
+    var finalURL: URL {
+        URL(fileURLWithPath: finalPath).standardizedFileURL
+    }
+
+    var workingURL: URL {
+        URL(fileURLWithPath: workingPath).standardizedFileURL
+    }
+}
+
+/// 独占持有一个 advisory lock descriptor，并保证所有退出路径只释放一次。
+private final class DownloadTransactionFileLock: @unchecked Sendable {
+    private let stateLock = NSLock()
+    private var descriptor: Int32
+
+    init(descriptor: Int32) {
+        self.descriptor = descriptor
+    }
+
+    deinit {
+        release()
+    }
+
+    func release() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard descriptor >= 0 else { return }
+        _ = flock(descriptor, LOCK_UN)
+        _ = Darwin.close(descriptor)
+        descriptor = -1
+    }
 }
 
 /// 持有一个跨进程 advisory lock。进程崩溃时内核会自动释放锁，但 manifest 会保留，
@@ -23,19 +54,20 @@ final class DownloadTransactionLease: @unchecked Sendable {
     private let lockURL: URL
     private let fileManager: FileManager
     private let stateLock = NSLock()
-    private var lockFileDescriptor: Int32
+    private let fileLock: DownloadTransactionFileLock
+    private var isReleased = false
 
-    init(
+    fileprivate init(
         id: UUID,
         markerURL: URL,
         lockURL: URL,
-        lockFileDescriptor: Int32,
+        fileLock: DownloadTransactionFileLock,
         fileManager: FileManager
     ) {
         self.id = id
         self.markerURL = markerURL
         self.lockURL = lockURL
-        self.lockFileDescriptor = lockFileDescriptor
+        self.fileLock = fileLock
         self.fileManager = fileManager
     }
 
@@ -56,7 +88,8 @@ final class DownloadTransactionLease: @unchecked Sendable {
     private func release(removeRegistration: Bool) {
         stateLock.lock()
         defer { stateLock.unlock() }
-        guard lockFileDescriptor >= 0 else { return }
+        guard !isReleased else { return }
+        isReleased = true
 
         if removeRegistration {
             do {
@@ -75,9 +108,7 @@ final class DownloadTransactionLease: @unchecked Sendable {
             }
         }
 
-        _ = flock(lockFileDescriptor, LOCK_UN)
-        _ = Darwin.close(lockFileDescriptor)
-        lockFileDescriptor = -1
+        fileLock.release()
     }
 }
 
@@ -85,6 +116,7 @@ final class DownloadTransactionLease: @unchecked Sendable {
 /// manifest 只记录精确的 final/working 路径；活跃事务用 flock 跨进程保护，崩溃后锁自动释放。
 final class DownloadTransactionRegistry: @unchecked Sendable {
     static let shared = DownloadTransactionRegistry(baseDirectory: defaultBaseDirectory)
+    static let defaultOrphanGracePeriod: TimeInterval = 60 * 60
 
     private static let defaultBaseDirectory: URL = {
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -95,65 +127,50 @@ final class DownloadTransactionRegistry: @unchecked Sendable {
     }()
 
     let baseDirectory: URL
+    let orphanGracePeriod: TimeInterval
     private let fileManager: FileManager
 
-    init(baseDirectory: URL, fileManager: FileManager = .default) {
+    init(
+        baseDirectory: URL,
+        orphanGracePeriod: TimeInterval = DownloadTransactionRegistry.defaultOrphanGracePeriod,
+        fileManager: FileManager = .default
+    ) {
         self.baseDirectory = baseDirectory
+        self.orphanGracePeriod = orphanGracePeriod
         self.fileManager = fileManager
     }
 
-    func register(
-        id: UUID,
-        finalURL: URL,
-        workingURL: URL,
-        isDirectory: Bool,
-        createdAt: Date = Date()
-    ) throws -> DownloadTransactionLease {
+    fileprivate func register(_ manifest: DownloadTransactionManifest) throws -> DownloadTransactionLease {
         try fileManager.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
 
-        let markerURL = self.markerURL(for: id)
-        let lockURL = self.lockURL(for: id)
-        let descriptor = openLockFile(at: lockURL)
-        guard descriptor >= 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-            let code = POSIXErrorCode(rawValue: errno) ?? .EIO
-            _ = Darwin.close(descriptor)
-            throw POSIXError(code)
+        let markerURL = self.markerURL(for: manifest.id)
+        let lockURL = self.lockURL(for: manifest.id)
+        guard let fileLock = try acquireLock(at: lockURL) else {
+            throw POSIXError(.EWOULDBLOCK)
         }
 
         do {
-            let manifest = DownloadTransactionManifest(
-                schemaVersion: 1,
-                id: id,
-                createdAt: createdAt,
-                finalPath: finalURL.path,
-                workingPath: workingURL.path,
-                isDirectory: isDirectory
-            )
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             try encoder.encode(manifest).write(to: markerURL, options: .atomic)
         } catch {
-            _ = flock(descriptor, LOCK_UN)
-            _ = Darwin.close(descriptor)
+            fileLock.release()
             try? fileManager.removeItem(at: markerURL)
             try? fileManager.removeItem(at: lockURL)
             throw error
         }
 
         return DownloadTransactionLease(
-            id: id,
+            id: manifest.id,
             markerURL: markerURL,
             lockURL: lockURL,
-            lockFileDescriptor: descriptor,
+            fileLock: fileLock,
             fileManager: fileManager
         )
     }
 
     @discardableResult
-    func sweepOrphans() throws -> DownloadTransactionSweepResult {
+    func sweepOrphans(now: Date = Date()) throws -> DownloadTransactionSweepResult {
         guard fileManager.fileExists(atPath: baseDirectory.path) else {
             return DownloadTransactionSweepResult(examinedCount: 0, reclaimedCount: 0)
         }
@@ -173,18 +190,20 @@ final class DownloadTransactionRegistry: @unchecked Sendable {
             let rawID = markerURL.deletingPathExtension().lastPathComponent
             guard let id = UUID(uuidString: rawID) else { continue }
             let lockURL = self.lockURL(for: id)
-            let descriptor = openLockFile(at: lockURL)
-            guard descriptor >= 0 else { continue }
-
-            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-                _ = Darwin.close(descriptor)
+            let fileLock: DownloadTransactionFileLock
+            do {
+                guard let acquiredLock = try acquireLock(at: lockURL) else { continue }
+                fileLock = acquiredLock
+            } catch {
                 continue
             }
+            defer { fileLock.release() }
 
             let didReclaim = reclaimOrphan(
                 id: id,
                 markerURL: markerURL,
-                lockURL: lockURL
+                lockURL: lockURL,
+                now: now
             )
             if didReclaim { reclaimed += 1 }
             if !fileManager.fileExists(atPath: markerURL.path) {
@@ -192,8 +211,6 @@ final class DownloadTransactionRegistry: @unchecked Sendable {
                 // marker 已不存在，安全删除这个无主的小文件，避免竞态累积。
                 try? fileManager.removeItem(at: lockURL)
             }
-            _ = flock(descriptor, LOCK_UN)
-            _ = Darwin.close(descriptor)
         }
 
         if reclaimed > 0 {
@@ -202,7 +219,12 @@ final class DownloadTransactionRegistry: @unchecked Sendable {
         return DownloadTransactionSweepResult(examinedCount: examined, reclaimedCount: reclaimed)
     }
 
-    private func reclaimOrphan(id: UUID, markerURL: URL, lockURL: URL) -> Bool {
+    private func reclaimOrphan(
+        id: UUID,
+        markerURL: URL,
+        lockURL: URL,
+        now: Date
+    ) -> Bool {
         guard let data = try? Data(contentsOf: markerURL) else { return false }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -211,6 +233,12 @@ final class DownloadTransactionRegistry: @unchecked Sendable {
               manifest.id == id,
               let workingURL = validatedWorkingURL(from: manifest)
         else {
+            return false
+        }
+        // A released lock proves there is no active writer, but it does not make a just-created
+        // partial old enough to reclaim. Preserve recent crash artefacts until the conservative
+        // TTL expires, as required by the destination transaction ownership contract.
+        guard now.timeIntervalSince(manifest.createdAt) >= orphanGracePeriod else {
             return false
         }
 
@@ -246,8 +274,8 @@ final class DownloadTransactionRegistry: @unchecked Sendable {
     }
 
     private func validatedWorkingURL(from manifest: DownloadTransactionManifest) -> URL? {
-        let finalURL = URL(fileURLWithPath: manifest.finalPath).standardizedFileURL
-        let workingURL = URL(fileURLWithPath: manifest.workingPath).standardizedFileURL
+        let finalURL = manifest.finalURL
+        let workingURL = manifest.workingURL
         guard finalURL.isFileURL, workingURL.isFileURL,
               finalURL.deletingLastPathComponent().path == workingURL.deletingLastPathComponent().path,
               !finalURL.lastPathComponent.isEmpty
@@ -268,14 +296,26 @@ final class DownloadTransactionRegistry: @unchecked Sendable {
         baseDirectory.appendingPathComponent("\(id.uuidString).lock", isDirectory: false)
     }
 
-    private func openLockFile(at url: URL) -> Int32 {
-        url.withUnsafeFileSystemRepresentation { path in
+    private func acquireLock(at url: URL) throws -> DownloadTransactionFileLock? {
+        let descriptor: Int32 = url.withUnsafeFileSystemRepresentation { path -> Int32 in
             guard let path else {
                 errno = EINVAL
                 return -1
             }
             return Darwin.open(path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
         }
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            let code = errno
+            _ = Darwin.close(descriptor)
+            if code == EWOULDBLOCK || code == EAGAIN {
+                return nil
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        return DownloadTransactionFileLock(descriptor: descriptor)
     }
 }
 
@@ -326,24 +366,21 @@ public struct DownloadDestinationTransaction: @unchecked Sendable {
 
     internal typealias ItemExchanger = @Sendable (URL, URL) throws -> Void
 
-    public let finalURL: URL
-    public let workingURL: URL
-    public let isDirectory: Bool
+    public var finalURL: URL { manifest.finalURL }
+    public var workingURL: URL { manifest.workingURL }
+    public var isDirectory: Bool { manifest.isDirectory }
+    private let manifest: DownloadTransactionManifest
     private let fileManager: FileManager
     private let itemExchanger: ItemExchanger?
     private let lease: DownloadTransactionLease
 
     private init(
-        finalURL: URL,
-        workingURL: URL,
-        isDirectory: Bool,
+        manifest: DownloadTransactionManifest,
         fileManager: FileManager,
         itemExchanger: ItemExchanger?,
         lease: DownloadTransactionLease
     ) {
-        self.finalURL = finalURL
-        self.workingURL = workingURL
-        self.isDirectory = isDirectory
+        self.manifest = manifest
         self.fileManager = fileManager
         self.itemExchanger = itemExchanger
         self.lease = lease
@@ -366,6 +403,7 @@ public struct DownloadDestinationTransaction: @unchecked Sendable {
     internal static func begin(
         finalURL: URL,
         isDirectory: Bool,
+        createdAt: Date = Date(),
         fileManager: FileManager = .default,
         itemExchanger: ItemExchanger? = nil,
         registry: DownloadTransactionRegistry
@@ -397,12 +435,15 @@ public struct DownloadDestinationTransaction: @unchecked Sendable {
             component: workingName,
             isDirectory: isDirectory
         )
-        let lease = try registry.register(
+        let manifest = DownloadTransactionManifest(
+            schemaVersion: 1,
             id: id,
-            finalURL: finalURL,
-            workingURL: workingURL,
-            isDirectory: isDirectory
+            createdAt: createdAt,
+            finalPath: finalURL.path,
+            workingPath: workingURL.path,
+            isDirectory: isDirectory,
         )
+        let lease = try registry.register(manifest)
 
         do {
             if isDirectory {
@@ -414,9 +455,7 @@ public struct DownloadDestinationTransaction: @unchecked Sendable {
         }
 
         return DownloadDestinationTransaction(
-            finalURL: finalURL,
-            workingURL: workingURL,
-            isDirectory: isDirectory,
+            manifest: manifest,
             fileManager: fileManager,
             itemExchanger: itemExchanger,
             lease: lease
@@ -424,8 +463,8 @@ public struct DownloadDestinationTransaction: @unchecked Sendable {
     }
 
     @discardableResult
-    static func sweepOrphans() throws -> DownloadTransactionSweepResult {
-        try DownloadTransactionRegistry.shared.sweepOrphans()
+    static func sweepOrphans(now: Date = Date()) throws -> DownloadTransactionSweepResult {
+        try DownloadTransactionRegistry.shared.sweepOrphans(now: now)
     }
 
     public func commit() throws {
