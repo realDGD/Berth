@@ -14,7 +14,6 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         store = SFTPDragStagingStore(
             baseDirectory: tempDirectoryURL,
             interruptedGracePeriod: 3600, // 1 hour
-            legacyGracePeriod: 86400,    // 24 hours
             minimumSweepInterval: 60     // 60 seconds
         )
     }
@@ -38,9 +37,32 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let metadata = try decoder.decode(StagingMarkerMetadata.self, from: data)
+        XCTAssertEqual(metadata.schemaVersion, 2)
         XCTAssertEqual(metadata.id, lease.id)
+        XCTAssertEqual(metadata.ownerNonce, lease.ownerNonce)
+        XCTAssertNotNil(metadata.heartbeatAt)
         XCTAssertEqual(metadata.payloadName, "bundle.tar.gz")
         XCTAssertNil(metadata.deliveredAt)
+    }
+
+    func testActiveLeaseRefreshesHeartbeat() async throws {
+        let t0 = Date().addingTimeInterval(-3600)
+        let heartbeatStore = SFTPDragStagingStore(
+            baseDirectory: tempDirectoryURL,
+            heartbeatInterval: 0.02,
+            heartbeatTimeout: 1
+        )
+        let lease = try await heartbeatStore.create(named: "heartbeat.bin", isDirectory: false, now: t0)
+        try await Task.sleep(for: .milliseconds(80))
+
+        let markerURL = lease.rootURL.appendingPathComponent(SFTPDragStagingStore.markerFilename)
+        let data = try Data(contentsOf: markerURL)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let metadata = try decoder.decode(StagingMarkerMetadata.self, from: data)
+        XCTAssertGreaterThan(try XCTUnwrap(metadata.heartbeatAt), t0)
+
+        await heartbeatStore.discard(lease)
     }
 
     func testCreateWithMaliciousNameThrowsAndDoesNotEscape() async throws {
@@ -388,6 +410,70 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
     }
 
+    func testSchemaV2FreshForeignHeartbeatProtectsLease() async throws {
+        let storeNonce = UUID()
+        let customStore = SFTPDragStagingStore(
+            baseDirectory: tempDirectoryURL,
+            interruptedGracePeriod: 3600,
+            heartbeatTimeout: 300,
+            ownerNonce: storeNonce,
+            processLivenessChecker: { _ in true }
+        )
+        let leaseID = UUID()
+        let rootURL = tempDirectoryURL.appendingPathComponent("\(SFTPDragStagingStore.prefix)\(leaseID.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        let now = Date()
+        let metadata = StagingMarkerMetadata(
+            schemaVersion: 2,
+            id: leaseID,
+            pid: 777777,
+            ownerNonce: UUID(),
+            createdAt: now.addingTimeInterval(-7200),
+            heartbeatAt: now.addingTimeInterval(-60),
+            payloadName: "foreign-active.bin",
+            isDirectory: false
+        )
+        try writeMarker(metadata, under: rootURL)
+
+        let result = try await customStore.sweepStale(now: now)
+
+        XCTAssertEqual(result.reclaimedCount, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
+    }
+
+    func testSchemaV2StaleHeartbeatWithReusedPIDUsesOrphanGrace() async throws {
+        let now = Date()
+        let customStore = SFTPDragStagingStore(
+            baseDirectory: tempDirectoryURL,
+            interruptedGracePeriod: 3600,
+            heartbeatTimeout: 300,
+            ownerNonce: UUID(),
+            processLivenessChecker: { _ in true }
+        )
+        let leaseID = UUID()
+        let rootURL = tempDirectoryURL.appendingPathComponent("\(SFTPDragStagingStore.prefix)\(leaseID.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        let metadata = StagingMarkerMetadata(
+            schemaVersion: 2,
+            id: leaseID,
+            pid: ProcessInfo.processInfo.processIdentifier,
+            ownerNonce: UUID(),
+            createdAt: now.addingTimeInterval(-7200),
+            heartbeatAt: now.addingTimeInterval(-7200),
+            payloadName: "pid-reused.bin",
+            isDirectory: false
+        )
+        try writeMarker(metadata, under: rootURL)
+
+        let firstSweep = try await customStore.sweepStale(now: now)
+        XCTAssertEqual(firstSweep.reclaimedCount, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
+
+        let secondSweep = try await customStore.sweepStale(now: now.addingTimeInterval(3601))
+        XCTAssertEqual(secondSweep.reclaimedCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: rootURL.path))
+    }
+
     func testProcessLivenessCheckerBehavior() {
         // Current process is alive
         let currentPID = ProcessInfo.processInfo.processIdentifier
@@ -401,38 +487,20 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         XCTAssertFalse(SFTPDragStagingStore.defaultProcessLivenessChecker(0))
     }
 
-    // MARK: - Legacy markerless staging tests (P1-1)
+    // MARK: - Marker ownership tests
 
-    func testLegacyMarkerlessOldDirectoryIsSwept() async throws {
-        let legacyUUID = UUID()
-        let rootURL = tempDirectoryURL.appendingPathComponent("\(SFTPDragStagingStore.prefix)\(legacyUUID.uuidString)", isDirectory: true)
+    func testMarkerlessUUIDDirectoryIsNeverSwept() async throws {
+        let unknownUUID = UUID()
+        let rootURL = tempDirectoryURL.appendingPathComponent("\(SFTPDragStagingStore.prefix)\(unknownUUID.uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
-        let payloadURL = rootURL.appendingPathComponent("legacy_file.txt")
-        try "legacy data".write(to: payloadURL, atomically: true, encoding: .utf8)
+        let payloadURL = rootURL.appendingPathComponent("unowned.txt")
+        try "must remain".write(to: payloadURL, atomically: true, encoding: .utf8)
 
         // Set modification date to 48 hours ago
         let oldDate = Date().addingTimeInterval(-48 * 3600)
         try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: rootURL.path)
 
         let sweepResult = try await store.sweepStale(now: Date())
-        XCTAssertEqual(sweepResult.reclaimedLegacyCount, 1)
-        XCTAssertEqual(sweepResult.reclaimedCount, 1)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: rootURL.path))
-    }
-
-    func testLegacyMarkerlessRecentDirectoryIsNOTSwept() async throws {
-        let legacyUUID = UUID()
-        let rootURL = tempDirectoryURL.appendingPathComponent("\(SFTPDragStagingStore.prefix)\(legacyUUID.uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
-        let payloadURL = rootURL.appendingPathComponent("recent_file.txt")
-        try "recent data".write(to: payloadURL, atomically: true, encoding: .utf8)
-
-        // Set modification date to only 1 hour ago (legacy TTL is 24h)
-        let recentDate = Date().addingTimeInterval(-3600)
-        try FileManager.default.setAttributes([.modificationDate: recentDate], ofItemAtPath: rootURL.path)
-
-        let sweepResult = try await store.sweepStale(now: Date())
-        XCTAssertEqual(sweepResult.reclaimedLegacyCount, 0)
         XCTAssertEqual(sweepResult.reclaimedCount, 0)
         XCTAssertTrue(FileManager.default.fileExists(atPath: rootURL.path))
     }
@@ -502,5 +570,14 @@ final class SFTPDragStagingStoreTests: XCTestCase {
         // Sweep 70 seconds later with force: false (exceeds interval)
         let activeResult = try await store.sweepStale(now: now.addingTimeInterval(70), force: false)
         XCTAssertEqual(activeResult.reclaimedCount, 1, "Sweep should execute once interval has elapsed")
+    }
+
+    private func writeMarker(_ metadata: StagingMarkerMetadata, under rootURL: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(metadata).write(
+            to: rootURL.appendingPathComponent(SFTPDragStagingStore.markerFilename),
+            options: .atomic
+        )
     }
 }

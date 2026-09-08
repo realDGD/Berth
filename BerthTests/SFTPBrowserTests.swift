@@ -920,7 +920,7 @@ final class SFTPBrowserTests: XCTestCase {
         let started = expectation(description: "download started")
         let wasCancelled = expectation(description: "download received cancellation")
 
-        browser.downloadExecutor = { entry, remotePath, localURL, sftp, budget, config, onPlan, onProgress in
+        browser.downloadExecutor = { _ in
             started.fulfill()
             do {
                 try await Task.sleep(for: .seconds(5))
@@ -967,8 +967,8 @@ final class SFTPBrowserTests: XCTestCase {
         let completedA = expectation(description: "A completed")
         let cancelledB = expectation(description: "B cancelled")
 
-        browser.downloadExecutor = { entry, remotePath, localURL, sftp, budget, config, onPlan, onProgress in
-            if entry.name == "fileA.bin" {
+        browser.downloadExecutor = { request in
+            if request.entry.name == "fileA.bin" {
                 startedA.fulfill()
                 try await Task.sleep(for: .milliseconds(300))
                 completedA.fulfill()
@@ -1015,7 +1015,7 @@ final class SFTPBrowserTests: XCTestCase {
         let started = expectation(description: "transfer started")
         let innerCancelled = expectation(description: "inner transfer task received cancellation")
 
-        browser.downloadExecutor = { entry, remotePath, localURL, sftp, budget, config, onPlan, onProgress in
+        browser.downloadExecutor = { _ in
             started.fulfill()
             do {
                 try await Task.sleep(for: .seconds(5))
@@ -1061,7 +1061,7 @@ final class SFTPBrowserTests: XCTestCase {
         let entry = SFTPBrowser.Entry(name: "drag_cancel.bin", isDirectory: false, isSymlink: false, size: 100, sizeIsKnown: true, modified: Date())
 
         let started = expectation(description: "drag download started")
-        browser.downloadExecutor = { entry, remotePath, localURL, sftp, budget, config, onPlan, onProgress in
+        browser.downloadExecutor = { _ in
             started.fulfill()
             try await Task.sleep(for: .seconds(5))
             return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 100)
@@ -1102,7 +1102,7 @@ final class SFTPBrowserTests: XCTestCase {
         let scanningStarted = expectation(description: "scanning started")
         let scanningCancelled = expectation(description: "scanning cancelled")
 
-        browser.downloadExecutor = { entry, remotePath, localURL, sftp, budget, config, onPlan, onProgress in
+        browser.downloadExecutor = { _ in
             scanningStarted.fulfill()
             do {
                 try await Task.sleep(for: .seconds(5))
@@ -1136,21 +1136,21 @@ final class SFTPBrowserTests: XCTestCase {
     func testDragCancellationErrorNormalization() {
         // Swift.CancellationError normalized to CocoaError.userCancelled
         let swiftCancel = CancellationError()
-        let normalized = SFTPDragProvider.normalizedCancellationError(swiftCancel)
+        let normalized = SFTPTransferCancellation.normalizedError(swiftCancel)
         XCTAssertTrue(normalized is CocoaError)
         XCTAssertEqual((normalized as? CocoaError)?.code, CocoaError.Code.userCancelled)
 
         // CocoaError.userCancelled stays CocoaError.userCancelled
         let cocoaCancel = CocoaError(.userCancelled)
-        XCTAssertEqual((SFTPDragProvider.normalizedCancellationError(cocoaCancel) as? CocoaError)?.code, .userCancelled)
+        XCTAssertEqual((SFTPTransferCancellation.normalizedError(cocoaCancel) as? CocoaError)?.code, .userCancelled)
 
         // Real error is preserved and NOT converted
         let notFound = CocoaError(.fileNoSuchFile)
-        let normalizedNotFound = SFTPDragProvider.normalizedCancellationError(notFound)
+        let normalizedNotFound = SFTPTransferCancellation.normalizedError(notFound)
         XCTAssertEqual((normalizedNotFound as? CocoaError)?.code, .fileNoSuchFile)
 
         let posixError = POSIXError(.EACCES)
-        let normalizedPosix = SFTPDragProvider.normalizedCancellationError(posixError)
+        let normalizedPosix = SFTPTransferCancellation.normalizedError(posixError)
         XCTAssertTrue(normalizedPosix is POSIXError)
         XCTAssertEqual((normalizedPosix as? POSIXError)?.code, .EACCES)
     }
@@ -1169,7 +1169,7 @@ final class SFTPBrowserTests: XCTestCase {
             progressCancelled.fulfill()
         }
 
-        browser.downloadExecutor = { entry, remotePath, localURL, sftp, budget, config, onPlan, onProgress in
+        browser.downloadExecutor = { _ in
             started.fulfill()
             try await Task.sleep(for: .seconds(5))
             return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 1000)
@@ -1218,7 +1218,7 @@ final class SFTPBrowserTests: XCTestCase {
         let progress = Progress(totalUnitCount: 1)
 
         let started = expectation(description: "scan started")
-        browser.downloadExecutor = { entry, remotePath, localURL, sftp, budget, config, onPlan, onProgress in
+        browser.downloadExecutor = { _ in
             started.fulfill()
             try await Task.sleep(for: .seconds(5))
             return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 0)
@@ -1230,7 +1230,7 @@ final class SFTPBrowserTests: XCTestCase {
                 _ = try await browser.downloadForDrag(entry, remoteDirectory: "/remote", to: lease.payloadURL, progress: progress)
             } catch {
                 await customStore.discard(lease)
-                let finalError = SFTPDragProvider.normalizedCancellationError(error)
+                let finalError = SFTPTransferCancellation.normalizedError(error)
                 completionError = finalError
                 throw finalError
             }
