@@ -563,7 +563,9 @@ enum SFTPDownloadEngine {
                 for entry in result.entries.sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending }) {
                     try Task.checkCancellation()
                     guard entry.name != ".", entry.name != ".." else { continue }
-                    guard (try? LocalPathComponentValidator.validateComponent(entry.name)) != nil else { continue }
+                    // Reject an incomplete tree before creating local files instead of silently
+                    // omitting an entry (or an entire subtree) and reporting download success.
+                    try LocalPathComponentValidator.validateComponent(entry.name)
                     let childPath = appendRemotePath(result.pending.remotePath, entry.name)
                     let childComponents = result.pending.relativeComponents + [entry.name]
                     switch entry.kind {

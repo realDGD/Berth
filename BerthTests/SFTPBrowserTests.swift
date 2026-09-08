@@ -824,22 +824,36 @@ final class SFTPBrowserTests: XCTestCase {
         )
     }
 
-    func testDirectoryPlanSkipsUnsafeRemoteNames() async throws {
+    func testDirectoryPlanRejectsUnsafeRemoteNames() async throws {
         let budget = SFTPDownloadEngine.TransferBudget(requestLimit: 8, handleLimit: 2)
-        let entries = [
-            SFTPDownloadEngine.DirectoryEntry(name: "safe.txt", kind: .file, size: 100),
-            SFTPDownloadEngine.DirectoryEntry(name: "../escape.txt", kind: .file, size: 100),
-            SFTPDownloadEngine.DirectoryEntry(name: "evil/nested.txt", kind: .file, size: 100),
-            SFTPDownloadEngine.DirectoryEntry(name: "null\0byte.txt", kind: .file, size: 100)
-        ]
-
-        let plan = try await SFTPDownloadEngine.makeDirectoryDownloadPlan(
-            remoteRoot: "/remote/test",
-            budget: budget,
-            configuration: .init()
-        ) { _ in entries }
-
-        XCTAssertEqual(plan.files.map(\.relativeComponents), [["safe.txt"]])
+        for name in ["", "../escape.txt", "evil/nested.txt", "null\0byte.txt", "line\nbreak.txt"] {
+            for kind in [SFTPDownloadEngine.DirectoryEntry.Kind.file, .directory] {
+                do {
+                    _ = try await SFTPDownloadEngine.makeDirectoryDownloadPlan(
+                        remoteRoot: "/remote/test",
+                        budget: budget,
+                        configuration: .init()
+                    ) { path in
+                        if path == "/remote/test" {
+                            return [.init(name: "nested", kind: .directory)]
+                        }
+                        return [
+                            .init(name: ".", kind: .directory),
+                            .init(name: "..", kind: .directory),
+                            .init(name: "safe.txt", kind: .file, size: 100),
+                            .init(name: name, kind: kind, size: 100)
+                        ]
+                    }
+                    XCTFail("An invalid file or directory must fail the whole download plan")
+                } catch let error as LocalPathComponentValidator.ValidationError {
+                    XCTAssertNotNil(error.errorDescription)
+                }
+                let requests = await budget.currentRequestCount
+                let handles = await budget.currentHandleCount
+                XCTAssertEqual(requests, 0)
+                XCTAssertEqual(handles, 0)
+            }
+        }
     }
 
     @MainActor
