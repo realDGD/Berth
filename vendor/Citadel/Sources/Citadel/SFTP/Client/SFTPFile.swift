@@ -1,24 +1,27 @@
 import NIO
+import NIOConcurrencyHelpers // [Berth patch] protects SFTPFile's cross-task active state.
 import Logging
 
 /// A "handle" for accessing a file that has been successfully opened on an SFTP server. File handles support
 /// reading (if opened with read access) and writing/appending (if opened with write/append access).
-public final class SFTPFile {
+public final class SFTPFile: @unchecked Sendable { // [Berth patch] READ pipeline shares one handle.
     /// A typealias to clarify when a buffer is being used as a file handle.
     ///
     /// This should probably be a `struct` wrapping a buffer for stronger type safety.
     public typealias SFTPFileHandle = ByteBuffer
     
     /// Indicates whether the file's handle was still valid at the time the getter was called.
-    public private(set) var isActive: Bool
+    private let activeState: NIOLockedValueBox<Bool> // [Berth patch] serialize close/read lifecycle.
+
+    public var isActive: Bool {
+        activeState.withLockedValue { $0 }
+    }
     
     /// The raw buffer whose contents are were contained in the `.handle()` result from the SFTP server.
     /// Used for performing operations on the open file.
     ///
     /// - Note: Make this `private` when concurrency isn't in a separate file anymore.
     internal let handle: SFTPFileHandle
-    
-    internal let path: String
     
     /// The `SFTPClient` this handle belongs to.
     ///
@@ -29,11 +32,10 @@ public final class SFTPFile {
     /// having taken ownership of the handle; nothing else should continue to use the handle.
     ///
     /// Do not create instances of `SFTPFile` yourself; use `SFTPClient.openFile()`.
-    internal init(client: SFTPClient, path: String, handle: SFTPFileHandle) {
-        self.isActive = true
+    internal init(client: SFTPClient, handle: SFTPFileHandle) {
+        self.activeState = NIOLockedValueBox(true)
         self.handle = handle
         self.client = client
-        self.path = path
     }
     
     /// A `Logger` for the file. Uses the logger of the client that opened the file.
@@ -45,7 +47,7 @@ public final class SFTPFile {
         }
     }
     
-    /// Read the attributes of the file. This is equivalent to the `stat()` system call.
+    /// Read the attributes of the file handle. This is equivalent to the `fstat()` system call.
     ///
     /// - Returns: File attributes including size, permissions, etc
     /// - Throws: SFTPError if the file handle is invalid or request fails
@@ -62,9 +64,10 @@ public final class SFTPFile {
     public func readAttributes() async throws -> SFTPFileAttributes {
         guard self.isActive else { throw SFTPError.fileHandleInvalid }
         
-        guard case .attributes(let attributes) = try await self.client.sendRequest(.stat(.init(
+        // [Berth patch] FSTAT must address this open handle; STAT(path) is a stale/racy snapshot.
+        guard case .attributes(let attributes) = try await self.client.sendRequest(.fstat(.init(
             requestId: self.client.allocateRequestId(),
-            path: path
+            handle: self.handle
         ))) else {
             self.logger.warning("SFTP server returned bad response to read file request, this is a protocol error")
             throw SFTPError.invalidResponse
@@ -261,7 +264,12 @@ public final class SFTPFile {
         
         self.logger.debug("SFTP closing and invalidating file \(self.handle.sftpHandleDebugDescription)")
         
-        self.isActive = false
+        // [Berth patch] atomically claim the close so concurrent cleanup cannot send duplicate CLOSE.
+        guard activeState.withLockedValue({ active -> Bool in
+            guard active else { return false }
+            active = false
+            return true
+        }) else { return }
         let result = try await self.client.sendRequest(.closeFile(.init(requestId: self.client.allocateRequestId(), handle: self.handle)))
         
         guard case .status(let status) = result else {

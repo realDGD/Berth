@@ -91,6 +91,7 @@ targets:
       - path: Berth/Core/SSH/SSHErrorMapper.swift
       - path: Berth/Core/SSH/KeyboardInteractiveAuth.swift
       - path: Berth/Core/SSH/KnownHostsStore.swift
+      - path: Berth/Core/SSH/LocalPathComponentValidator.swift
       - path: Berth/Core/SSH/HostKeyValidation.swift
       - path: Berth/Core/SSH/OpenSSHFormat.swift
       - path: Berth/Core/SSH/PrivateKeyFormat.swift
@@ -100,6 +101,7 @@ targets:
       - path: Berth/Core/SSH/ProxyConnector.swift
       - path: Berth/Core/SSH/SOCKS5.swift
       - path: Berth/Core/SSH/SFTPBrowser.swift
+      - path: Berth/Core/SSH/SFTPDownloadEngine.swift
       - path: Berth/Core/SSH/ServerInfo.swift
       - path: Berth/Core/Services/KeyStore.swift
       - path: Berth/Core/Services/HostReachability.swift
