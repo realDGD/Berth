@@ -767,14 +767,22 @@ final class SFTPBrowser {
         editLocalURLs[remotePath] = localURL
 
         editing[remotePath] = .syncing
+        let budget = transferBudget
+        let configuration = self.configuration
         let task = Task { [weak self] in
             do {
                 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                // 下载
-                let file = try await sftp.openFile(filePath: remotePath, flags: .read)
-                let buffer = try await file.readAll()
-                try? await file.close()
-                try Data(buffer.readableBytesView).write(to: localURL)
+                // 下载走下载引擎:按实际读到的字节推进,服务器谎报大小/提前 EOF 都能正确收尾。
+                // 不用 Citadel 的 readAll():它按 FSTAT 大小循环,超量 DATA 会整数下溢崩溃,
+                // 提前 EOF 会无限发 READ,而且整个文件都在内存里
+                _ = try await SFTPDownloadEngine.downloadFile(
+                    remotePath: remotePath,
+                    expectedSize: entry.sizeIsKnown ? entry.size : nil,
+                    localURL: localURL,
+                    sftp: sftp,
+                    budget: budget,
+                    configuration: configuration
+                )
                 await MainActor.run {
                     self?.editing[remotePath] = .idle
                     if openInEditor { Self.openWithPreferredEditor(localURL) }
@@ -839,20 +847,45 @@ final class SFTPBrowser {
         }
     }
 
+    /// 预览上限:列表里的大小是服务器说的,真读时仍按此截断,多读到一个字节就判定过大
+    static let previewLimit = 256 * 1024
+
     /// 快速预览:下载小文本文件(≤256KB)返回内容;过大或二进制返回 nil
     func previewText(_ entry: Entry) async -> String? {
-        guard let sftp, !entry.isDirectory, entry.size <= 256 * 1024 else { return nil }
+        guard let sftp, !entry.isDirectory, entry.size <= UInt64(Self.previewLimit) else { return nil }
         do {
             let file = try await sftp.openFile(filePath: join(path, entry.name), flags: .read)
-            let buffer = try await file.readAll()
+            let data: Data?
+            do {
+                data = try await Self.readPrefix(of: file, limit: Self.previewLimit)
+            } catch {
+                try? await file.close()
+                throw error
+            }
             try? await file.close()
-            let data = Data(buffer.readableBytesView)
+            guard let data else { return nil }
             // 含 NUL 视为二进制
             if data.prefix(8000).contains(0) { return nil }
             return String(data: data, encoding: .utf8)
         } catch {
             return nil
         }
+    }
+
+    /// 从头最多读 limit 字节;文件比 limit 长返回 nil。每次 READ 按实际返回长度推进,
+    /// 服务器回空 DATA/EOF 即停,不依赖 FSTAT 报的大小(Citadel readAll 的下溢/死循环根源)。
+    private static func readPrefix(of file: SFTPFile, limit: Int) async throws -> Data? {
+        var data = Data()
+        data.reserveCapacity(min(limit, 64 * 1024))
+        let chunk: UInt32 = 32 * 1024
+        while data.count <= limit {
+            var buffer = try await file.read(from: UInt64(data.count), length: chunk)
+            guard buffer.readableBytes > 0,
+                  let bytes = buffer.readBytes(length: buffer.readableBytes) else { break }
+            data.append(contentsOf: bytes)
+            if data.count > limit { return nil }
+        }
+        return data
     }
 
     // 书签(常用远端目录,全局持久化)
