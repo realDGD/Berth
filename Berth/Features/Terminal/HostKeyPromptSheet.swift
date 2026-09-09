@@ -12,15 +12,25 @@ struct HostKeyPromptSheet: View {
                 Image(systemName: prompt.isKeyChange ? "exclamationmark.triangle.fill" : "key.fill")
                     .font(.system(size: 28))
                     .foregroundStyle(prompt.isKeyChange ? .red : .accentColor)
-                Text(prompt.isKeyChange ? "主机密钥已变更!" : "首次连接此主机")
-                    .font(.title3.bold())
+                switch prompt.kind {
+                case .firstConnection:
+                    Text("首次连接此主机").font(.title3.bold())
+                case .keyChanged:
+                    Text("主机密钥已变更!").font(.title3.bold())
+                case .newKeyType:
+                    Text("主机出示了新类型的密钥!").font(.title3.bold())
+                }
             }
 
-            if prompt.isKeyChange {
+            switch prompt.kind {
+            case .firstConnection:
+                Text("无法验证 \(prompt.hostname):\(String(prompt.port)) 的真实性。请核对下方指纹与服务器提供方公布的一致后再继续。")
+                    .font(.callout)
+            case .keyChanged:
                 Text("\(prompt.hostname):\(String(prompt.port)) 返回的主机密钥与 known_hosts 中的记录不一致。这可能意味着中间人攻击,也可能是服务器重装或更换了密钥。请先向服务器管理员核实,再决定是否继续。")
                     .font(.callout)
-            } else {
-                Text("无法验证 \(prompt.hostname):\(String(prompt.port)) 的真实性。请核对下方指纹与服务器提供方公布的一致后再继续。")
+            case .newKeyType:
+                Text("\(prompt.hostname):\(String(prompt.port)) 出示的 \(prompt.keyType) 密钥在 known_hosts 中没有记录,已记录的是其它类型的密钥。这可能是服务器新增了密钥类型,也可能是中间人只提供另一种类型来绕过比对。请先向服务器管理员核实下方指纹,再决定是否继续。")
                     .font(.callout)
             }
 
@@ -32,7 +42,7 @@ struct HostKeyPromptSheet: View {
                         .textSelection(.enabled)
                 }
                 if prompt.isKeyChange {
-                    LabeledContent("原记录指纹") {
+                    LabeledContent(prompt.kind == .newKeyType ? "已记录的其它类型指纹" : "原记录指纹") {
                         VStack(alignment: .leading) {
                             ForEach(prompt.knownFingerprints, id: \.self) { fingerprint in
                                 Text(fingerprint)
