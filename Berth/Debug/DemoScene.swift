@@ -1,3 +1,4 @@
+#if DEBUG
 import AppKit
 import Foundation
 import SwiftData
@@ -202,3 +203,4 @@ enum DemoScene {
         try? data.write(to: file)
     }
 }
+#endif

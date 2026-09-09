@@ -1,3 +1,4 @@
+#if DEBUG
 import AppKit
 
 /// 窗口自截图:BERTH_WINDOW_SNAPSHOT=<png 路径> 时,启动后延时把主窗口(含标题栏)渲染成 PNG。
@@ -9,10 +10,13 @@ import AppKit
 enum WindowSnapshot {
     static func runIfRequested() async {
         let env = ProcessInfo.processInfo.environment
-        // defaults 参数版(-berth.windowSnapshot <路径>):不带 BERTH_ 环境变量,
-        // 不会被启动逻辑当成自动化环境 —— 用于截「真实会话恢复」路径
+        // 启动参数版(-berth.windowSnapshot <路径>):不带 BERTH_ 环境变量,
+        // 不会被启动逻辑当成自动化环境 —— 用于截「真实会话恢复」路径。
+        // 只读 NSArgumentDomain,不读持久 defaults:否则一次 defaults write 就能让
+        // 之后每次启动都把窗口(含终端内容)截图写到任意路径
+        let argumentDomain = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
         guard let path = env["BERTH_WINDOW_SNAPSHOT"]
-            ?? UserDefaults.standard.string(forKey: "berth.windowSnapshot") else { return }
+            ?? argumentDomain["berth.windowSnapshot"] as? String else { return }
         // 造工作空间演示数据:两个空间 + 三台摆设主机(配临时库,截侧栏分页条用)
         if env["BERTH_SNAPSHOT_SPACES"] == "1", let container = SessionManager.shared.modelContainer {
             let context = container.mainContext
@@ -100,3 +104,4 @@ enum WindowSnapshot {
         try? png.write(to: URL(fileURLWithPath: path))
     }
 }
+#endif

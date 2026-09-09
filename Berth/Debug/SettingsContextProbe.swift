@@ -1,3 +1,4 @@
+#if DEBUG
 import AppKit
 import Foundation
 import SwiftData
@@ -86,3 +87,4 @@ enum SettingsContextProbe {
         try? (existing + text + "\n").write(toFile: path, atomically: true, encoding: .utf8)
     }
 }
+#endif
