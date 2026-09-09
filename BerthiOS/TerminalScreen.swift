@@ -157,9 +157,17 @@ struct TerminalScreen: View {
         }
     }
 
+    private func hostKeyTitle(_ prompt: HostKeyPrompt) -> String {
+        switch prompt.kind {
+        case .firstConnection: return String(localized: "首次连接此主机")
+        case .keyChanged: return String(localized: "主机密钥已变更!")
+        case .newKeyType: return String(localized: "主机出示了新类型的密钥!")
+        }
+    }
+
     private func hostKeySheet(_ prompt: HostKeyPrompt, session: IOSTerminalSession) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(prompt.isKeyChange ? String(localized: "主机密钥已变更!") : String(localized: "首次连接此主机"))
+            Text(hostKeyTitle(prompt))
                 .font(.headline)
                 .foregroundStyle(prompt.isKeyChange ? .red : .primary)
             Text("\(prompt.hostname):\(String(prompt.port)) · \(prompt.keyType)")
@@ -171,7 +179,9 @@ struct TerminalScreen: View {
                 .foregroundStyle(theme.current.secondaryText)
                 .textSelection(.enabled)
             if prompt.isKeyChange {
-                Text(String(localized: "原记录指纹"))
+                Text(prompt.kind == .newKeyType
+                     ? String(localized: "已记录的其它类型指纹")
+                     : String(localized: "原记录指纹"))
                     .font(.caption2)
                     .foregroundStyle(.red)
                 ForEach(prompt.knownFingerprints, id: \.self) { fingerprint in
@@ -390,9 +400,11 @@ private struct TerminalHostingView: UIViewRepresentable {
         func hostCurrentDirectoryUpdate(source: SwiftTerm.TerminalView, directory: String?) {}
         func scrolled(source: SwiftTerm.TerminalView, position: Double) {}
         func requestOpenLink(source: SwiftTerm.TerminalView, link: String, params: [String: String]) {
-            if let url = URL(string: link) {
-                UIApplication.shared.open(url)
-            }
+            // 链接文本来自远端(OSC 8 / 自动识别):只放行网页与邮件,
+            // 不让服务器借 tel:/sms:/shortcuts: 等 scheme 拉起其它 app
+            guard let url = URL(string: link), let scheme = url.scheme?.lowercased(),
+                  ["http", "https", "mailto"].contains(scheme) else { return }
+            UIApplication.shared.open(url)
         }
         func bell(source: SwiftTerm.TerminalView) {}
         func clipboardCopy(source: SwiftTerm.TerminalView, content: Data) {
@@ -401,7 +413,9 @@ private struct TerminalHostingView: UIViewRepresentable {
             }
         }
         func clipboardRead(source: SwiftTerm.TerminalView) -> Data? {
-            UIPasteboard.general.string.flatMap { $0.data(using: .utf8) }
+            // OSC 52 读查询任何服务器(或 cat 出来的文件)都能发,回应就等于把剪贴板里的
+            // 密码/验证码交给远端。与 Mac 端一致,一律拒绝;写入(复制到剪贴板)仍保留。
+            nil
         }
         func iTermContent(source: SwiftTerm.TerminalView, content: ArraySlice<UInt8>) {}
         func rangeChanged(source: SwiftTerm.TerminalView, startY: Int, endY: Int) {}
