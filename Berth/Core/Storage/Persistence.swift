@@ -57,7 +57,9 @@ enum Persistence {
                 ?? dupes.min { $0.sortOrder < $1.sortOrder }!
             for host in dupes where host.id != keeper.id {
                 KeychainStore.deleteSecrets(for: host.id)
+                #if os(macOS)
                 AIChatHistory.deleteAll(hostKey: host.id.uuidString)
+                #endif
                 context.delete(host)
                 removed += 1
             }
