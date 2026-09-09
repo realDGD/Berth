@@ -3,6 +3,7 @@ import AppKit
 #endif
 import Citadel
 import Foundation
+import UniformTypeIdentifiers
 import NIOCore
 
 /// Bridges worker-thread progress to the observable browser state.  Disk and network work never
@@ -728,7 +729,12 @@ final class SFTPBrowser {
                 return
             }
         }
-        NSWorkspace.shared.open(url)
+        // 文件名(含扩展名)由服务器决定,不能交给 LaunchServices 按扩展名挑默认程序:
+        // notes.terminal / .webloc / .mobileconfig 会被直接「执行」而不是编辑。
+        // 「本地编辑」的语义就是当文本改,固定用系统默认的纯文本编辑器打开。
+        let textEditor = NSWorkspace.shared.urlForApplication(toOpen: UTType.plainText)
+            ?? URL(fileURLWithPath: "/System/Applications/TextEdit.app")
+        NSWorkspace.shared.open([url], withApplicationAt: textEditor, configuration: NSWorkspace.OpenConfiguration())
         #endif
     }
 
