@@ -1,3 +1,4 @@
+import Citadel
 import Foundation
 import NIOCore
 import NIOSSH
@@ -102,6 +103,10 @@ struct SessionTerminationClassifier: Sendable {
         }
 
         if error is KeyboardInteractiveAuthError || error is SSHDialer.DialError || error is HostKeyError {
+            return .authentication
+        }
+        // Citadel 把密码/密钥全部被拒统一抛这个:自动重连与仪表盘据此停止重试
+        if case SSHClientError.allAuthenticationOptionsFailed = error {
             return .authentication
         }
 
