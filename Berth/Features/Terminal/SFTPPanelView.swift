@@ -361,6 +361,17 @@ struct SFTPPanelView: View {
                                 .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(.secondary)
                         }
+                        if item.canCancel {
+                            if item.isCancelling {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                    .frame(width: 18, height: 18)
+                            } else {
+                                TransferCancelButton {
+                                    browser?.cancelTransfer(item.id)
+                                }
+                            }
+                        }
                     }
                     if let p = item.progress {
                         ProgressView(value: p)
@@ -372,6 +383,30 @@ struct SFTPPanelView: View {
         }
         .padding(.horizontal, 12).padding(.vertical, 6)
         .background(theme.elevatedBackground)
+    }
+
+    private struct TransferCancelButton: View {
+        let action: () -> Void
+        @State private var isHovered = false
+
+        var body: some View {
+            Button(action: action) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(isHovered ? Color.primary : Color.secondary)
+                    .frame(width: 18, height: 18)
+                    .background {
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(isHovered ? Color.primary.opacity(0.10) : Color.clear)
+                    }
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                isHovered = hovering
+            }
+            .help(String(localized: "取消传输"))
+        }
     }
 
     private func centered<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {

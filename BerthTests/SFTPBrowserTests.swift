@@ -855,7 +855,6 @@ final class SFTPBrowserTests: XCTestCase {
             }
         }
     }
-
     @MainActor
     func testDragDownloadRejectsUnsafeTopLevelNameBeforeSFTPAccess() async {
         let browser = SFTPBrowser {
@@ -888,4 +887,374 @@ final class SFTPBrowserTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
     }
 
+    func testSFTPDragRetentionPolicyCalculations() {
+        XCTAssertEqual(SFTPDragRetentionPolicy.retentionInterval(payloadBytes: nil), 1800)
+        XCTAssertEqual(SFTPDragRetentionPolicy.retentionInterval(payloadBytes: 0), 1800)
+
+        let hundredMiB: UInt64 = 100 * 1024 * 1024
+        XCTAssertEqual(SFTPDragRetentionPolicy.retentionInterval(payloadBytes: hundredMiB), 1800)
+
+        let tenGiB: UInt64 = 10 * 1024 * 1024 * 1024
+        XCTAssertEqual(SFTPDragRetentionPolicy.retentionInterval(payloadBytes: tenGiB), 5120)
+
+        let hundredGiB: UInt64 = 100 * 1024 * 1024 * 1024
+        XCTAssertEqual(SFTPDragRetentionPolicy.retentionInterval(payloadBytes: hundredGiB), 51200)
+    }
+
+    // MARK: - Download Cancellation Tests
+
+    func testSingleDownloadCancellation() async throws {
+        let browser = SFTPBrowser {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("test-cancel.bin")
+        let entry = SFTPBrowser.Entry(
+            name: "test-cancel.bin",
+            isDirectory: false,
+            isSymlink: false,
+            size: 1024,
+            sizeIsKnown: true,
+            modified: Date()
+        )
+
+        let started = expectation(description: "download started")
+        let wasCancelled = expectation(description: "download received cancellation")
+
+        browser.downloadExecutor = { _ in
+            started.fulfill()
+            do {
+                try await Task.sleep(for: .seconds(5))
+                return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 1024)
+            } catch is CancellationError {
+                wasCancelled.fulfill()
+                throw CancellationError()
+            }
+        }
+
+        let downloadTask = Task {
+            await browser.download(entry, to: tempURL)
+        }
+
+        await fulfillment(of: [started], timeout: 2.0)
+        XCTAssertEqual(browser.transfers.count, 1)
+        let transfer = try XCTUnwrap(browser.transfers.first)
+        XCTAssertTrue(transfer.canCancel)
+        XCTAssertFalse(transfer.isCancelling)
+
+        // Cancel the transfer
+        browser.cancelTransfer(transfer.id)
+        XCTAssertTrue(browser.transfers.first?.isCancelling == true)
+
+        await fulfillment(of: [wasCancelled], timeout: 2.0)
+        await downloadTask.value
+
+        // Row removed and state is NOT failed
+        XCTAssertEqual(browser.transfers.count, 0)
+        if case .failed = browser.state {
+            XCTFail("Browser state must NOT be .failed when user cancels transfer")
+        }
+    }
+
+    func testMultiDownloadIndependentCancellation() async throws {
+        let browser = SFTPBrowser {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let entryA = SFTPBrowser.Entry(name: "fileA.bin", isDirectory: false, isSymlink: false, size: 100, sizeIsKnown: true, modified: Date())
+        let entryB = SFTPBrowser.Entry(name: "fileB.bin", isDirectory: false, isSymlink: false, size: 200, sizeIsKnown: true, modified: Date())
+
+        let startedA = expectation(description: "A started")
+        let startedB = expectation(description: "B started")
+        let completedA = expectation(description: "A completed")
+        let cancelledB = expectation(description: "B cancelled")
+
+        browser.downloadExecutor = { request in
+            if request.entry.name == "fileA.bin" {
+                startedA.fulfill()
+                try await Task.sleep(for: .milliseconds(300))
+                completedA.fulfill()
+                return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 100)
+            } else {
+                startedB.fulfill()
+                do {
+                    try await Task.sleep(for: .seconds(5))
+                    return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 200)
+                } catch is CancellationError {
+                    cancelledB.fulfill()
+                    throw CancellationError()
+                }
+            }
+        }
+
+        let taskA = Task { await browser.download(entryA, to: URL(fileURLWithPath: "/tmp/a")) }
+        let taskB = Task { await browser.download(entryB, to: URL(fileURLWithPath: "/tmp/b")) }
+
+        await fulfillment(of: [startedA, startedB], timeout: 2.0)
+        XCTAssertEqual(browser.transfers.count, 2)
+
+        let transferB = try XCTUnwrap(browser.transfers.first(where: { $0.label.contains("fileB") }))
+
+        // Cancel ONLY transfer B
+        browser.cancelTransfer(transferB.id)
+
+        await fulfillment(of: [cancelledB, completedA], timeout: 3.0)
+        await taskA.value
+        await taskB.value
+
+        XCTAssertEqual(browser.transfers.count, 0)
+        if case .failed = browser.state {
+            XCTFail("Neither cancelled B nor completed A should put browser in failed state")
+        }
+    }
+
+    func testCancellationPropagationFromOuterTask() async throws {
+        let browser = SFTPBrowser {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let entry = SFTPBrowser.Entry(name: "outer-cancel.bin", isDirectory: false, isSymlink: false, size: 500, sizeIsKnown: true, modified: Date())
+
+        let started = expectation(description: "transfer started")
+        let innerCancelled = expectation(description: "inner transfer task received cancellation")
+
+        browser.downloadExecutor = { _ in
+            started.fulfill()
+            do {
+                try await Task.sleep(for: .seconds(5))
+                return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 500)
+            } catch is CancellationError {
+                innerCancelled.fulfill()
+                throw CancellationError()
+            }
+        }
+
+        let outerTask = Task {
+            try await browser.downloadForDrag(entry, remoteDirectory: "/remote", to: URL(fileURLWithPath: "/tmp/test"), progress: Progress())
+        }
+
+        await fulfillment(of: [started], timeout: 2.0)
+
+        // Cancel outer Task (simulating Progress.cancel() / Finder cancellation)
+        outerTask.cancel()
+
+        await fulfillment(of: [innerCancelled], timeout: 2.0)
+        do {
+            _ = try await outerTask.value
+            XCTFail("Outer task must throw CancellationError")
+        } catch is CancellationError {
+            // Expected
+        }
+        XCTAssertEqual(browser.transfers.count, 0)
+    }
+
+    func testDragDownloadCancellationCleansUpStagingRoot() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DragCancelTest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let customStore = SFTPDragStagingStore(baseDirectory: tempDir)
+        let lease = try await customStore.create(named: "drag_cancel.bin", isDirectory: false)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: lease.rootURL.path))
+
+        let browser = SFTPBrowser {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let entry = SFTPBrowser.Entry(name: "drag_cancel.bin", isDirectory: false, isSymlink: false, size: 100, sizeIsKnown: true, modified: Date())
+
+        let started = expectation(description: "drag download started")
+        browser.downloadExecutor = { _ in
+            started.fulfill()
+            try await Task.sleep(for: .seconds(5))
+            return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 100)
+        }
+
+        let dragTask = Task {
+            do {
+                _ = try await browser.downloadForDrag(entry, remoteDirectory: "/remote", to: lease.payloadURL, progress: Progress())
+            } catch {
+                await customStore.discard(lease)
+                throw error
+            }
+        }
+
+        await fulfillment(of: [started], timeout: 2.0)
+        let transfer = try XCTUnwrap(browser.transfers.first)
+
+        // Cancel transfer from Berth UI
+        browser.cancelTransfer(transfer.id)
+
+        do {
+            _ = try await dragTask.value
+            XCTFail("Drag task should throw CancellationError")
+        } catch is CancellationError {
+            // Expected
+        }
+
+        // Verify staging directory was immediately cleaned up
+        XCTAssertFalse(FileManager.default.fileExists(atPath: lease.rootURL.path), "Staging root must be cleaned up on drag cancellation")
+    }
+
+    func testFolderScanningPhaseIsCancellable() async throws {
+        let browser = SFTPBrowser {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let dirEntry = SFTPBrowser.Entry(name: "deep-folder", isDirectory: true, isSymlink: false, size: 0, sizeIsKnown: false, modified: Date())
+
+        let scanningStarted = expectation(description: "scanning started")
+        let scanningCancelled = expectation(description: "scanning cancelled")
+
+        browser.downloadExecutor = { _ in
+            scanningStarted.fulfill()
+            do {
+                try await Task.sleep(for: .seconds(5))
+                return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 0)
+            } catch is CancellationError {
+                scanningCancelled.fulfill()
+                throw CancellationError()
+            }
+        }
+
+        let downloadTask = Task {
+            await browser.download(dirEntry, to: URL(fileURLWithPath: "/tmp/folder"))
+        }
+
+        await fulfillment(of: [scanningStarted], timeout: 2.0)
+        let transfer = try XCTUnwrap(browser.transfers.first)
+        XCTAssertTrue(transfer.canCancel)
+        XCTAssertEqual(transfer.label, "扫描 deep-folder…")
+
+        // Cancel during scanning
+        browser.cancelTransfer(transfer.id)
+
+        await fulfillment(of: [scanningCancelled], timeout: 2.0)
+        await downloadTask.value
+        XCTAssertEqual(browser.transfers.count, 0)
+        if case .failed = browser.state {
+            XCTFail("Browser state must NOT be .failed when scanning is cancelled")
+        }
+    }
+
+    func testDragCancellationErrorNormalization() {
+        // Swift.CancellationError normalized to CocoaError.userCancelled
+        let swiftCancel = CancellationError()
+        let normalized = SFTPTransferCancellation.normalizedError(swiftCancel)
+        XCTAssertTrue(normalized is CocoaError)
+        XCTAssertEqual((normalized as? CocoaError)?.code, CocoaError.Code.userCancelled)
+
+        // CocoaError.userCancelled stays CocoaError.userCancelled
+        let cocoaCancel = CocoaError(.userCancelled)
+        XCTAssertEqual((SFTPTransferCancellation.normalizedError(cocoaCancel) as? CocoaError)?.code, .userCancelled)
+
+        // Real error is preserved and NOT converted
+        let notFound = CocoaError(.fileNoSuchFile)
+        let normalizedNotFound = SFTPTransferCancellation.normalizedError(notFound)
+        XCTAssertEqual((normalizedNotFound as? CocoaError)?.code, .fileNoSuchFile)
+
+        let posixError = POSIXError(.EACCES)
+        let normalizedPosix = SFTPTransferCancellation.normalizedError(posixError)
+        XCTAssertTrue(normalizedPosix is POSIXError)
+        XCTAssertEqual((normalizedPosix as? POSIXError)?.code, .EACCES)
+    }
+
+    func testBerthUICancelPropagatesToExternalProgress() async throws {
+        let browser = SFTPBrowser {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let entry = SFTPBrowser.Entry(name: "drag-progress.bin", isDirectory: false, isSymlink: false, size: 1000, sizeIsKnown: true, modified: Date())
+        let progress = Progress(totalUnitCount: 1000)
+
+        let started = expectation(description: "download started")
+        let progressCancelled = expectation(description: "external progress cancelled")
+
+        progress.cancellationHandler = {
+            progressCancelled.fulfill()
+        }
+
+        browser.downloadExecutor = { _ in
+            started.fulfill()
+            try await Task.sleep(for: .seconds(5))
+            return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 1000)
+        }
+
+        let downloadTask = Task {
+            try await browser.downloadForDrag(
+                entry,
+                remoteDirectory: "/remote",
+                to: URL(fileURLWithPath: "/tmp/dest"),
+                progress: progress
+            )
+        }
+
+        await fulfillment(of: [started], timeout: 2.0)
+        let transfer = try XCTUnwrap(browser.transfers.first)
+
+        // Berth UI cancel button clicked
+        browser.cancelTransfer(transfer.id)
+
+        // Must trigger externalProgress.cancel() and its cancellationHandler
+        await fulfillment(of: [progressCancelled], timeout: 2.0)
+
+        do {
+            _ = try await downloadTask.value
+            XCTFail("Download task must throw CancellationError")
+        } catch is CancellationError {
+            // Expected
+        }
+    }
+
+    func testScanningCancellationStagingCleanupAndNormalization() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScanCancelTest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let customStore = SFTPDragStagingStore(baseDirectory: tempDir)
+        let lease = try await customStore.create(named: "scan_cancel_folder", isDirectory: true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: lease.rootURL.path))
+
+        let browser = SFTPBrowser {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let entry = SFTPBrowser.Entry(name: "scan_cancel_folder", isDirectory: true, isSymlink: false, size: 0, sizeIsKnown: false, modified: Date())
+        let progress = Progress(totalUnitCount: 1)
+
+        let started = expectation(description: "scan started")
+        browser.downloadExecutor = { _ in
+            started.fulfill()
+            try await Task.sleep(for: .seconds(5))
+            return SFTPDownloadEngine.SFTPDownloadResult(copiedBytes: 0)
+        }
+
+        var completionError: Error?
+        let dragTask = Task {
+            do {
+                _ = try await browser.downloadForDrag(entry, remoteDirectory: "/remote", to: lease.payloadURL, progress: progress)
+            } catch {
+                await customStore.discard(lease)
+                let finalError = SFTPTransferCancellation.normalizedError(error)
+                completionError = finalError
+                throw finalError
+            }
+        }
+
+        await fulfillment(of: [started], timeout: 2.0)
+        let transfer = try XCTUnwrap(browser.transfers.first)
+        XCTAssertEqual(transfer.label, "扫描 scan_cancel_folder…")
+
+        // Cancel during scanning
+        browser.cancelTransfer(transfer.id)
+
+        do {
+            _ = try await dragTask.value
+            XCTFail("Drag task should throw error")
+        } catch {
+            // Expected
+        }
+
+        // 1. Error passed to completion must be CocoaError.userCancelled
+        XCTAssertTrue(completionError is CocoaError)
+        XCTAssertEqual((completionError as? CocoaError)?.code, .userCancelled)
+
+        // 2. Staging root was removed
+        XCTAssertFalse(FileManager.default.fileExists(atPath: lease.rootURL.path))
+    }
 }

@@ -33,38 +33,43 @@ enum SFTPDragProvider {
         ) { completion in
             let total = !entry.isDirectory && entry.size > 0 ? Int64(clamping: entry.size) : 1
             let progress = Progress(totalUnitCount: total)
-            let task = Task { @MainActor in
-                let temporaryDirectory = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("Berth-Drag-\(UUID().uuidString)", isDirectory: true)
-                let localURL = temporaryDirectory.appendingPathComponent(
-                    entry.name,
-                    isDirectory: entry.isDirectory
-                )
+            let task = Task {
+                let lease: SFTPDragStagingLease
+                do {
+                    lease = try await SFTPDragStagingStore.shared.create(
+                        named: entry.name,
+                        isDirectory: entry.isDirectory
+                    )
+                } catch {
+                    completion(nil, false, error)
+                    return
+                }
 
                 do {
                     guard let browser else {
                         throw CocoaError(.fileNoSuchFile)
                     }
-                    try FileManager.default.createDirectory(
-                        at: temporaryDirectory,
-                        withIntermediateDirectories: true
-                    )
-                    try await browser.downloadForDrag(
+                    let result = try await browser.downloadForDrag(
                         entry,
                         remoteDirectory: remoteDirectory,
-                        to: localURL,
+                        to: lease.payloadURL,
                         progress: progress
                     )
-                    completion(localURL, false, nil)
-                    // 文件表示的接收方可能在 completion 返回后才开始复制。给 Finder 足够的
-                    // 取用时间,再清理由 Berth 创建的临时副本;系统临时目录也会兜底清理。
+                    try await SFTPDragStagingStore.shared.markDelivered(lease, payloadBytes: result.copiedBytes)
+                    completion(lease.payloadURL, false, nil)
+                    // 文件表示的接收方可能在 completion 返回后才开始复制。
+                    // 依据实际成功写入本地的 payloadBytes, 通过统一策略源 SFTPDragRetentionPolicy
+                    // 计算预估消费窗口 (基线 30 分钟, 慢速介质按 2 MiB/s 延长),
+                    // 再清理由 Berth 创建的临时副本; 启动/新拖拽时也会兜底 sweep。
+                    let retentionSeconds = SFTPDragRetentionPolicy.retentionInterval(payloadBytes: result.copiedBytes)
                     Task.detached {
-                        try? await Task.sleep(for: .seconds(30 * 60))
-                        try? FileManager.default.removeItem(at: temporaryDirectory)
+                        try? await Task.sleep(for: .seconds(retentionSeconds))
+                        await SFTPDragStagingStore.shared.discardIfDelivered(lease)
                     }
                 } catch {
-                    completion(nil, false, error)
-                    try? FileManager.default.removeItem(at: temporaryDirectory)
+                    await SFTPDragStagingStore.shared.discard(lease)
+                    let finalError = SFTPTransferCancellation.normalizedError(error)
+                    completion(nil, false, finalError)
                 }
             }
             progress.cancellationHandler = { task.cancel() }
@@ -72,4 +77,5 @@ enum SFTPDragProvider {
         }
         return provider
     }
+
 }
