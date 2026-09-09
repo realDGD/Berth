@@ -20,10 +20,29 @@ enum AIChatHistory {
 
     private static var directory: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("Berth/AIChats", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var dir = appSupport.appendingPathComponent("Berth/AIChats", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: dir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        _ = hardenOnce
+        // 里面是远端命令的完整输出:不进 Time Machine / iCloud 备份
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? dir.setResourceValues(values)
         return dir
     }
+
+    /// 老版本写出的历史文件是 umask 默认的 0644,首次访问时收紧一次
+    private static let hardenOnce: Void = {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("Berth/AIChats", isDirectory: true)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        for url in files where url.pathExtension == "json" {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        }
+    }()
 
     static func hostKey(for spec: HostSpec) -> String {
         spec.isLocal ? "local" : spec.hostID.uuidString
@@ -34,7 +53,9 @@ enum AIChatHistory {
               let id = record["id"] as? String,
               JSONSerialization.isValidJSONObject(record),
               let data = try? JSONSerialization.data(withJSONObject: record) else { return }
-        try? data.write(to: directory.appendingPathComponent("\(id).json"), options: .atomic)
+        let url = directory.appendingPathComponent("\(id).json")
+        try? data.write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         if let hostKey = record["hostKey"] as? String { prune(hostKey: hostKey) }
     }
 
@@ -47,6 +68,15 @@ enum AIChatHistory {
     static func delete(id: UUID) {
         guard !disabled else { return }
         try? FileManager.default.removeItem(at: directory.appendingPathComponent("\(id.uuidString).json"))
+    }
+
+    /// 删除主机时连同它的全部对话历史(里面有那台机器上命令的完整输出)
+    static func deleteAll(hostKey: String) {
+        for record in allRecords(hostKey: hostKey) {
+            if let idString = record["id"] as? String, let id = UUID(uuidString: idString) {
+                delete(id: id)
+            }
+        }
     }
 
     /// 某台主机的全部历史对话,按更新时间倒序
