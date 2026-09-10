@@ -3026,6 +3026,16 @@
         }
       }
     },
+    "同一主机本次运行内验证一次即可;空闲 15 分钟或更换密钥、跳板机后再次验证。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "One verification per host per launch is enough; verify again after 15 idle minutes or when the key or jump host changes."
+          }
+        }
+      }
+    },
     "同步与数据": {
       "localizations": {
         "en": {
