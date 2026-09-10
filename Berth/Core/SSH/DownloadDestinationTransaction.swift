@@ -486,10 +486,13 @@ public struct DownloadDestinationTransaction: @unchecked Sendable {
                 try Self.exchangeItemsAtomically(workingURL, finalURL)
             }
 
-            // 原子交换已经是 commit point。workingURL 现在保存旧 final；清理失败时保留
-            // registry，让下次启动重试，不能把已成功提交的新 final 回报成失败。
+            // 原子交换已经是 commit point。RENAME_SWAP 成功时 workingURL 保存旧 final，
+            // rename(2) 回落路径下 working 已被消费；清理失败时保留 registry，让下次启动
+            // 重试，不能把已成功提交的新 final 回报成失败。
             do {
-                try fileManager.removeItem(at: workingURL)
+                if fileManager.fileExists(atPath: workingURL.path) {
+                    try fileManager.removeItem(at: workingURL)
+                }
                 lease.complete()
             } catch {
                 lease.abandon()
@@ -519,6 +522,8 @@ public struct DownloadDestinationTransaction: @unchecked Sendable {
         lease.abandon()
     }
 
+    /// 优先 renameatx_np(RENAME_SWAP)（APFS/HFS+，旧文件留在 lhs 供调用方清理）；exFAT、SMB、
+    /// NFS 等不支持交换的卷回落到 rename(2)：POSIX 语义下同样是原子替换，只是旧文件直接被覆盖。
     private static func exchangeItemsAtomically(_ lhs: URL, _ rhs: URL) throws {
         var callErrno: Int32 = 0
         let result: Int32 = lhs.withUnsafeFileSystemRepresentation { lhsPath in
@@ -527,15 +532,21 @@ public struct DownloadDestinationTransaction: @unchecked Sendable {
                     callErrno = EINVAL
                     return -1
                 }
-                let result = Darwin.renameatx_np(
+                let swapped = Darwin.renameatx_np(
                     AT_FDCWD,
                     lhsPath,
                     AT_FDCWD,
                     rhsPath,
                     UInt32(RENAME_SWAP)
                 )
-                if result != 0 { callErrno = errno }
-                return result
+                if swapped == 0 { return 0 }
+                guard errno == ENOTSUP || errno == EINVAL else {
+                    callErrno = errno
+                    return -1
+                }
+                let renamed = Darwin.rename(lhsPath, rhsPath)
+                if renamed != 0 { callErrno = errno }
+                return renamed
             }
         }
         guard result == 0 else {

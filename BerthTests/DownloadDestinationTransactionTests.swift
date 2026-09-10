@@ -395,6 +395,53 @@ final class DownloadDestinationTransactionTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: finalURL.path))
     }
 
+    // MARK: - 12. 不支持 RENAME_SWAP 的卷(exFAT/SMB/NFS):回落到 rename(2) 仍原子替换并释放登记
+
+    func testReplaceFallsBackToRenameOnVolumeWithoutSwapSupport() throws {
+        let image = tempDirectoryURL.appendingPathComponent("exfat.dmg")
+        let mountPoint = tempDirectoryURL.appendingPathComponent("exfat", isDirectory: true)
+        guard Self.run("/usr/bin/hdiutil", ["create", "-quiet", "-size", "8m", "-fs", "ExFAT", "-volname", "BerthTest", image.path]) == 0,
+              Self.run("/usr/bin/hdiutil", ["attach", "-quiet", "-nobrowse", "-mountpoint", mountPoint.path, image.path]) == 0
+        else {
+            throw XCTSkip("hdiutil cannot create or attach an exFAT image in this environment")
+        }
+        addTeardownBlock {
+            _ = Self.run("/usr/bin/hdiutil", ["detach", "-quiet", "-force", mountPoint.path])
+        }
+
+        let finalURL = mountPoint.appendingPathComponent("replace.bin")
+        try "OLD".write(to: finalURL, atomically: true, encoding: .utf8)
+        let registry = DownloadTransactionRegistry(
+            baseDirectory: tempDirectoryURL.appendingPathComponent("exfat-registry", isDirectory: true)
+        )
+        let tx = try DownloadDestinationTransaction.begin(finalURL: finalURL, isDirectory: false, registry: registry)
+        try "NEW".write(to: tx.workingURL, atomically: true, encoding: .utf8)
+
+        try tx.commit()
+
+        XCTAssertEqual(try String(contentsOf: finalURL, encoding: .utf8), "NEW")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tx.workingURL.path))
+        let manifests = try FileManager.default.contentsOfDirectory(atPath: registry.baseDirectory.path)
+            .filter { $0.hasSuffix(".json") }
+        XCTAssertTrue(manifests.isEmpty, "completed transaction must not leave a manifest behind")
+    }
+
+    @discardableResult
+    private static func run(_ executable: String, _ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return -1
+        }
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
     private func directoryContainsWorkingItem(for finalURL: URL) throws -> Bool {
         let prefix = ".\(finalURL.lastPathComponent).berth-part-"
         return try FileManager.default.contentsOfDirectory(atPath: finalURL.deletingLastPathComponent().path)
