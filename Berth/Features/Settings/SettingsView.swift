@@ -329,6 +329,8 @@ struct SettingsView: View {
     private var securityPage: some View {
             Section {
                 Toggle("使用私钥连接前要求 Touch ID / 密码验证", isOn: $requireTouchID)
+                Text("同一主机本次运行内验证一次即可;空闲 15 分钟或更换密钥、跳板机后再次验证。")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("粘贴保护:多行或危险命令先确认", isOn: $pasteProtection)
             }
     }

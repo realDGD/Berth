@@ -106,6 +106,8 @@ final class TerminalSession: Identifiable {
     @ObservationIgnored private var willBorrow: SSHConnection?
     /// 本次运行是否走了借用路径(借用会话不自动重连,避免网络抖动时多会话各自新建 TCP 造成连接风暴)
     @ObservationIgnored private var isBorrower = false
+    /// 本会话连上时在 KeyUseGrants 登记为「存活会话」了(断开时要注销)
+    @ObservationIgnored private var holdsKeyUseGrant = false
     @ObservationIgnored private var forwardService: PortForwardService?
     @ObservationIgnored private var sessionTask: Task<Void, Never>?
     @ObservationIgnored private var stdinWriter: AsyncStream<StdinEvent>.Continuation?
@@ -235,6 +237,11 @@ final class TerminalSession: Identifiable {
                 disconnectReason = .error(message)
             }
             state = .disconnected(disconnectReason)
+            // 门禁授权从断开这一刻起算空闲(服务器重启后 15 分钟内重连不必再过 Touch ID)
+            if holdsKeyUseGrant {
+                holdsKeyUseGrant = false
+                KeyUseGrants.shared.sessionDisconnected(spec)
+            }
             // 会话结束时质询弹窗必须收掉:服务器可能在用户找手机输 MFA 码时超时断开
             //(LoginGraceTime),不收的话 sheet 悬在死管道上,提交毫无反应
             resolveKeyboardInteractivePrompt(answers: nil)
@@ -914,10 +921,15 @@ final class TerminalSession: Identifiable {
                 await self?.requestKeyboardInteractiveAnswers(challenge)
             },
             keyGate: { [weak self] in
-                try await SSHDialer.touchIDGate(
-                    reason: String(localized: "使用私钥连接 \(self?.spec.label ?? "")"),
-                    onProgress: { detail in self?.state = .connecting(detail: detail) }
-                )
+                guard let self else { return }
+                // issue #29:同一主机本次运行内过一次门禁即可,重连/新建独立连接不再弹;
+                // 空闲 15 分钟或换了认证材料才重新验证(KeyUseGrants)
+                try await KeyUseGrants.shared.authorize(self.spec) {
+                    try await SSHDialer.touchIDGate(
+                        reason: String(localized: "使用私钥连接 \(self.spec.label)"),
+                        onProgress: { detail in self.state = .connecting(detail: detail) }
+                    )
+                }
             }
         )
     }
@@ -974,6 +986,7 @@ final class TerminalSession: Identifiable {
                 self.stdinWriter = continuation
                 self.syncTerminalSize()
                 self.state = .connected
+                self.holdsKeyUseGrant = KeyUseGrants.shared.sessionConnected(self.spec)
                 self.connectedAt = Date()
                 self.everConnected = true
                 self.reconnectAttempt = 0

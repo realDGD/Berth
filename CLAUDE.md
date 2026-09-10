@@ -70,7 +70,9 @@ BERTH_M1_AUTOTEST=1 BERTH_TRANSIENT_STORE=1 \
   密钥类型按「变更」级警告,证书形式主机密钥一律拒绝;认证失败不自动重连、仪表盘不重试;
   AI 自动执行只放行 `AICommandPolicy` 白名单里的只读命令,命令输出落盘/送模型前过
   `SecretRedactor`;远端命名的文件不交给 LaunchServices 默认程序(本地编辑固定用文本编辑器),
-  `LSFileQuarantineEnabled` 已开;终端不回应 OSC 52 读剪贴板,链接只放行 http/https/mailto(+Mac file)
+  `LSFileQuarantineEnabled` 已开;终端不回应 OSC 52 读剪贴板,链接只放行 http/https/mailto(+Mac file);
+  私钥门禁(Touch ID)按「本次运行 + 主机 + 认证材料」记一次(`KeyUseGrants`,issue #29):存活会话
+  期间不失效,断开后空闲 15 分钟失效,换密钥/跳板机重验,退出即清;仪表盘的后台授权独立
 - 发布形态:Developer ID 签名 + 公证 DMG,不走 App Store(沙盒限制 ~/.ssh 读取)
 - 本地化:zh-Hans 基准 + en,`Berth/Resources/Localizable.xcstrings`。新增 UI 文案后:构建 →
   从 DerivedData 的 `Berth.build/**/*.stringsdata` 汇总 key → 给缺失 key 补 en 翻译(SwiftUI
