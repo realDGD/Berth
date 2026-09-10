@@ -415,8 +415,9 @@ enum M2AcceptanceTest {
             return false
         }
 
+        // 目录下载不再合并进已有目录(DownloadDestinationTransaction 预检拒绝):目标必须不存在
         let downRoot = localRoot.appendingPathComponent("down", isDirectory: true)
-        try? fm.createDirectory(at: downRoot, withIntermediateDirectories: true)
+        try? fm.removeItem(at: downRoot)
         await browser.download(remoteDir, to: downRoot)
 
         let gotAlpha = (try? Data(contentsOf: downRoot.appendingPathComponent("a.txt"))) == alpha

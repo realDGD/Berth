@@ -389,12 +389,29 @@ final class SFTPBrowser {
 
     func download(_ entry: Entry, to localURL: URL) async {
         do {
-            try await performDownload(
-                entry,
-                remoteDirectory: path,
-                to: localURL,
-                externalProgress: nil
+            // Freeze the selected remote directory before the first suspension. Destination
+            // preparation performs file-system work on another actor; the user may navigate the
+            // SFTP panel while it is running, but that must not retarget this download.
+            let remoteDirectory = path
+            let worker = DownloadDestinationTransactionWorker.shared
+            let tx = try await worker.begin(
+                finalURL: localURL,
+                isDirectory: entry.isDirectory
             )
+            do {
+                try Task.checkCancellation()
+                try await performDownload(
+                    entry,
+                    remoteDirectory: remoteDirectory,
+                    to: tx.workingURL,
+                    externalProgress: nil
+                )
+                try Task.checkCancellation()
+                try await worker.commit(tx)
+            } catch {
+                await worker.discard(tx)
+                throw error
+            }
         } catch where SFTPTransferCancellation.isCancellation(error) {
             // 用户主动取消, 不改变 state 为 .failed
         } catch {
@@ -499,7 +516,13 @@ final class SFTPBrowser {
         }
 
         return try await withTaskCancellationHandler {
-            try await transferTask.value
+            let result = try await transferTask.value
+            // Task cancellation is cooperative: a custom/finishing executor may return success
+            // after cancelTransfer() has already cancelled it. Never let that race reach commit().
+            if transferTask.isCancelled || Task.isCancelled {
+                throw CancellationError()
+            }
+            return result
         } onCancel: {
             transferTask.cancel()
         }
