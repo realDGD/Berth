@@ -13,43 +13,60 @@ enum AICommandPolicy {
         "ps", "pgrep", "lsof", "netstat",
         "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "stat", "file", "readlink", "realpath",
         "which", "type", "echo", "true", "false", "test",
-        "last", "lastlog", "w", "who", "getent",
+        "last", "w", "who", "getent",
         "dpkg-query",
     ]
 
     /// 本身是诊断命令,但带特定参数就会改系统状态(hostname foo、date -s、route add、
-    /// nginx -s stop、rpm -e …):按原始大小写逐个参数判定,不放行的一律确认
+    /// nginx -s stop、rpm -e …):按原始大小写逐个参数判定。规则全是锚定比对:长参数整词
+    /// (连 `--opt=value` 一起认),短参数簇逐字母核对,不做 hasPrefix 之类的子串判断,
+    /// 否则 `--file=x`、`-s2020`、`-da` 这类写法就绕过去了
     private static let argumentRules: [String: ([String]) -> Bool] = [
-        // hostname <name> / -F file / -b 改主机名;只放行 -f/-i/-I/-s/-d 这类读取参数
-        "hostname": { args in args.allSatisfy { $0.hasPrefix("-") && !["-F", "--file", "-b", "--boot"].contains($0) } },
-        // date <MMDDhhmm> / -s / --set 设系统时间(BSD 的 -f 也会);只放行 +格式串 与读取参数
-        "date": { args in
-            args.allSatisfy { ($0.hasPrefix("+") || $0.hasPrefix("-")) && !["-s", "-f"].contains($0) && !$0.hasPrefix("--set") }
-        },
-        // ifconfig eth0 down / ifconfig eth0 10.0.0.2:只放行无参、-a 或单个接口名
-        "ifconfig": { args in args.count <= 1 && !["up", "down"].contains(args.first?.lowercased() ?? "") },
-        // route add/del …:只放行纯参数形式(route -n)
-        "route": { args in args.allSatisfy { $0.hasPrefix("-") } },
-        // arp -d/-s/-f 改 ARP 表
-        "arp": { args in args.allSatisfy { $0.hasPrefix("-") && !["-d", "-s", "-f"].contains($0) } },
-        // ss -K/--kill 杀 socket;短参数可能合写(-tK)
-        "ss": { args in !args.contains { $0 == "--kill" || ($0.hasPrefix("-") && !$0.hasPrefix("--") && $0.contains("K")) } },
-        // journalctl --vacuum-*/--rotate/--flush 删日志、动日志文件
-        "journalctl": { args in
-            let denied = ["--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush",
-                          "--sync", "--relinquish-var", "--smart-relinquish-var", "--setup-keys"]
-            return !args.contains { arg in denied.contains { arg == $0 || arg.hasPrefix($0 + "=") } }
-        },
-        // dmesg -c/-C 清内核缓冲,-n/-D/-E 改控制台级别;短参数可能合写(-Tc)
-        "dmesg": { args in
-            !args.contains { arg in
-                if arg.hasPrefix("--") {
-                    return ["--clear", "--read-clear", "--console-level", "--console-off", "--console-on"]
-                        .contains { arg == $0 || arg.hasPrefix($0 + "=") }
-                }
-                return arg.hasPrefix("-") && arg.contains { "cCnDE".contains($0) }
+        // hostname <name> / -F file / -b 改主机名;只放行读取参数
+        "hostname": { args in
+            args.allSatisfy {
+                ["-f", "--fqdn", "--long", "-i", "--ip-address", "-I", "--all-ip-addresses", "-s", "--short",
+                 "-d", "--domain", "-a", "--alias", "-A", "--all-fqdns", "-y", "--yp", "--nis", "-V", "--version"].contains($0)
             }
         },
+        // date <MMDDhhmm> / -s / --set 设系统时间(BSD 的 -f 也会);只放行 +格式串 与读取参数
+        "date": { args in
+            args.allSatisfy { arg in
+                arg.hasPrefix("+")
+                    || ["-u", "--utc", "--universal", "-R", "--rfc-email", "--rfc-2822", "-I", "--iso-8601",
+                        "--rfc-3339", "-j", "-n", "--version"].contains(arg)
+                    || longOption(arg, in: ["--iso-8601", "--rfc-3339", "--date"])
+                    || (arg.hasPrefix("-I") && arg.count > 2 && arg.dropFirst(2).allSatisfy(\.isLetter))
+            }
+        },
+        // ifconfig eth0 down / ifconfig eth0 10.0.0.2:只放行无参、单个选项或单个接口名
+        "ifconfig": { args in args.count <= 1 && !["up", "down"].contains(args.first?.lowercased() ?? "") },
+        // route add/del/flush 的动词不带 - 前缀;只放行 -n/-e/-v/-F/-C/-4/-6/-q/-t 这些查看选项
+        "route": { args in args.allSatisfy { shortFlags($0, in: "nevFC46qt") } },
+        // arp -d/-s/-f 改 ARP 表
+        "arp": { args in
+            args.allSatisfy { shortFlags($0, in: "anvelx") || ["--all", "--numeric", "--verbose", "--extended"].contains($0) }
+        },
+        // ss -K/--kill 杀 socket,-D/--diag 往文件写
+        "ss": { args in !args.contains { shortFlagsContain($0, any: "KD") || longOption($0, in: ["--kill", "--diag"]) } },
+        // journalctl --vacuum-*/--rotate/--flush/--update-catalog 删日志、动日志文件
+        "journalctl": { args in
+            !args.contains {
+                longOption($0, in: ["--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush", "--sync",
+                                    "--relinquish-var", "--smart-relinquish-var", "--setup-keys", "--update-catalog"])
+            }
+        },
+        // dmesg -c/-C 清内核缓冲,-n/-D/-E 改控制台级别
+        "dmesg": { args in
+            !args.contains {
+                shortFlagsContain($0, any: "cCnDE")
+                    || longOption($0, in: ["--clear", "--read-clear", "--console-level", "--console-off", "--console-on"])
+            }
+        },
+        // lastlog -C/--clear、-S/--set 改登录记录
+        "lastlog": { args in !args.contains { shortFlagsContain($0, any: "CS") || longOption($0, in: ["--clear", "--set"]) } },
+        // file -C/--compile 会在当前目录写 magic.mgc
+        "file": { args in !args.contains { shortFlagsContain($0, any: "C") || $0 == "--compile" } },
         // 服务程序只放行配置检查/版本:nginx -s reload、apachectl restart、裸 sshd(起守护进程)都要确认
         "nginx": { args in !args.isEmpty && args.allSatisfy { ["-t", "-T", "-v", "-V"].contains($0) } },
         "apachectl": { args in
@@ -57,16 +74,56 @@ enum AICommandPolicy {
         },
         "httpd": { args in !args.isEmpty && args.allSatisfy { ["-t", "-v", "-V", "-S", "-M", "-l", "-L"].contains($0) } },
         "sshd": { args in !args.isEmpty && args.allSatisfy { ["-t", "-T"].contains($0) } },
-        // rpm -e 卸载、-i/-U/-F 安装;只放行查询(-q…/--query)与校验(-V/--verify)
+        // rpm -e 卸载、-i/-U/-F 安装;--pipe/--eval/--define/--load 能借宏展开跑 shell。
+        // 只放行查询(-q 簇 / --query)与校验(-V / --verify)模式,其余参数逐个排除写操作
         "rpm": { args in
             guard let first = args.first,
-                  first.hasPrefix("-q") || first.hasPrefix("--query") || first == "-V" || first == "--verify"
+                  ["--query", "-V", "--verify"].contains(first)
+                    || (first.hasPrefix("-q") && first.dropFirst(2).allSatisfy { "acdfgilpsvRL".contains($0) })
             else { return false }
-            let denied: Set<String> = ["-e", "--erase", "-i", "--install", "-U", "--upgrade", "-F", "--freshen",
-                                       "--import", "--rebuilddb", "--initdb", "--restore", "--setperms", "--setugids", "--setcaps"]
-            return !args.contains { denied.contains($0) }
+            return !args.contains {
+                ["-e", "-i", "-U", "-F"].contains($0)
+                    || longOption($0, in: ["--erase", "--install", "--upgrade", "--freshen", "--import", "--rebuilddb",
+                                           "--initdb", "--restore", "--setperms", "--setugids", "--setcaps",
+                                           "--pipe", "--define", "--eval", "--load", "--macros", "--rcfile"])
+            }
         },
     ]
+
+    /// 长参数整词比对,连带 `--opt=value` 形式
+    private static func longOption(_ arg: String, in options: [String]) -> Bool {
+        options.contains { arg == $0 || arg.hasPrefix($0 + "=") }
+    }
+
+    /// 短参数簇(-abc)每个字母都在放行集合里
+    private static func shortFlags(_ arg: String, in letters: String) -> Bool {
+        arg.count > 1 && arg.hasPrefix("-") && !arg.hasPrefix("--") && arg.dropFirst().allSatisfy { letters.contains($0) }
+    }
+
+    /// 短参数簇里含任一给定字母(-tK、-Tc 这种合写也算)
+    private static func shortFlagsContain(_ arg: String, any letters: String) -> Bool {
+        arg.hasPrefix("-") && !arg.hasPrefix("--") && arg.dropFirst().contains { letters.contains($0) }
+    }
+
+    /// ip:选项 → 对象 → 动词 三段都按白名单。`ip netns exec …`、`ip route append …`、
+    /// `-b file` 批处理、`-n ns` 这些不在名单里的一律确认
+    private static func isReadOnlyIPCommand(_ words: [String]) -> Bool {
+        let options: Set<String> = ["-4", "-6", "-0", "-br", "-brief", "-s", "-stats", "-statistics", "-h", "-human",
+                                    "-human-readable", "-o", "-oneline", "-j", "-json", "-p", "-pretty", "-r", "-resolve",
+                                    "-a", "-all", "-t", "-timestamp", "-ts", "-tshort"]
+        let objects: Set<String> = ["addr", "address", "a", "route", "r", "link", "l", "neigh", "neighbour", "neighbor", "n",
+                                    "rule", "ru", "maddr", "maddress", "m", "tunnel", "tunl", "t"]
+        let verbs: Set<String> = ["show", "list", "ls", "sh", "lst", "get", "help", "showdump"]
+        var rest = words[...]
+        while let first = rest.first, first.hasPrefix("-") {
+            guard options.contains(first) else { return false }
+            rest = rest.dropFirst()
+        }
+        guard let object = rest.first, objects.contains(object) else { return false }
+        rest = rest.dropFirst()
+        guard let verb = rest.first else { return true }
+        return verbs.contains(verb)
+    }
 
     /// 只放行指定子命令的工具:首个词 → 允许的第二个词
     private static let readOnlySubcommands: [String: Set<String>] = [
@@ -77,7 +134,7 @@ enum AICommandPolicy {
         "podman": ["ps", "images", "logs", "inspect", "stats", "version", "info", "top", "port", "diff"],
         "kubectl": ["get", "describe", "logs", "version", "cluster-info", "top", "explain", "api-resources"],
         "git": ["status", "log", "diff", "show", "rev-parse", "describe", "branch", "remote", "tag", "stash"],
-        "ip": ["addr", "address", "a", "route", "r", "link", "l", "neigh", "n", "-br", "-brief", "-4", "-6", "-s"],
+        "ip": [],        // 见 isReadOnlyIPCommand:选项/对象/动词三段白名单
         "dpkg": ["-l", "-L", "-s", "--list", "--status", "--get-selections"],
         "apt": ["list", "show", "policy"],
         "apt-cache": ["policy", "show", "search"],
@@ -155,8 +212,12 @@ enum AICommandPolicy {
             return lowerWords.count == 2 && lowerWords[1] == "status"
         case "find":
             return true
+        case "ip":
+            return isReadOnlyIPCommand(lowerWords)
         case "git":
             guard let sub = lowerWords.first, allowedSubcommands.contains(sub) else { return false }
+            // git log/diff/show --output=<file> 会往任意路径写文件
+            if lowerWords.contains(where: { longOption($0, in: ["--output"]) }) { return false }
             if let readOnlyArguments = gitListOnlyArguments[sub] {
                 // git branch/tag/remote 不带参数是列出;git stash 不带参数是「存一份」,必须带 list/show
                 let arguments = lowerWords.dropFirst()

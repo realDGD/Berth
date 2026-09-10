@@ -11,7 +11,9 @@ final class AICommandPolicyTests: XCTestCase {
             "git stash list", "ip addr show", "find /srv -name '*.log' -mtime -1", "journalctl -u app -n 100",
             "hostname", "hostname -f", "date", "date +%s", "date -u", "ifconfig", "ifconfig eth0", "route -n",
             "arp -a", "ss -tulpn", "dmesg -T", "dmesg --level=err", "nginx -t", "apachectl configtest",
-            "httpd -S", "sshd -T", "rpm -qa", "rpm -q nginx", "rpm -V openssh-server",
+            "httpd -S", "sshd -T", "rpm -qa", "rpm -q nginx", "rpm -V openssh-server", "rpm -qi nginx", "rpm -ql nginx",
+            "ip -br addr", "ip route get 1.1.1.1", "ip -s link show dev eth0", "ip rule show", "arp -an",
+            "lastlog -u root", "file /bin/ls", "date -Iseconds", "date --iso-8601=seconds", "hostname -I",
         ] {
             XCTAssertTrue(AICommandPolicy.isSafeForAutoRun(command), "should auto-run: \(command)")
         }
@@ -41,6 +43,13 @@ final class AICommandPolicyTests: XCTestCase {
             "ss -K dst 1.2.3.4", "ss -tK", "journalctl --vacuum-time=1s", "journalctl --rotate",
             "dmesg -c", "dmesg -Tc", "dmesg --clear", "nginx -s stop", "nginx -s reload", "nginx",
             "apachectl restart", "apachectl -k stop", "httpd -k restart", "sshd", "rpm -e nginx", "rpm -ivh x.rpm",
+            // 绕过白名单的变体:长参数带 =、短参数带值、短参数合写、宏/管道执行
+            "hostname --file=/tmp/h", "hostname -F/tmp/h", "date -s2020-01-01", "date --set=2020-01-01",
+            "arp -da", "ss -tD /tmp/x", "ss --diag=/tmp/x", "rpm -qa --pipe rm", "rpm -qa --eval=%(id)",
+            "rpm -qa --define x", "ip -4 netns exec ns1 rm -rf /", "ip netns exec ns1 ls",
+            "ip route append default via 10.0.0.1", "ip -b /tmp/cmds", "ip -n ns1 addr",
+            "git log --output=/tmp/x", "git diff --output /tmp/x", "lastlog -C -u root", "lastlog --clear",
+            "journalctl --update-catalog", "file -C -m magic",
         ] {
             XCTAssertFalse(AICommandPolicy.isSafeForAutoRun(command), "must confirm: \(command)")
         }
