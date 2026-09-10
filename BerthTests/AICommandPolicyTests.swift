@@ -9,6 +9,9 @@ final class AICommandPolicyTests: XCTestCase {
             "systemctl status nginx", "service nginx status", "docker ps -a", "docker logs --tail 50 web",
             "kubectl get pods -n default", "git status", "git log --oneline -5", "git branch -a",
             "git stash list", "ip addr show", "find /srv -name '*.log' -mtime -1", "journalctl -u app -n 100",
+            "hostname", "hostname -f", "date", "date +%s", "date -u", "ifconfig", "ifconfig eth0", "route -n",
+            "arp -a", "ss -tulpn", "dmesg -T", "dmesg --level=err", "nginx -t", "apachectl configtest",
+            "httpd -S", "sshd -T", "rpm -qa", "rpm -q nginx", "rpm -V openssh-server",
         ] {
             XCTAssertTrue(AICommandPolicy.isSafeForAutoRun(command), "should auto-run: \(command)")
         }
@@ -32,6 +35,12 @@ final class AICommandPolicyTests: XCTestCase {
             "apt install nmap", "brew install foo", "npm install", "pip install x",
             "./deploy.sh", "/usr/bin/python3 evil.py", "PATH=/tmp ls", "env", "printenv", "eval ls",
             "bash -c ls", "xargs rm", "watch ls", "nohup ls",
+            // 诊断命令带写参数
+            "hostname evil", "hostname -F /tmp/h", "date -s 2020-01-01", "date 0910120026",
+            "ifconfig eth0 down", "ifconfig eth0 10.0.0.2", "route add default gw 10.0.0.1", "arp -d 10.0.0.1",
+            "ss -K dst 1.2.3.4", "ss -tK", "journalctl --vacuum-time=1s", "journalctl --rotate",
+            "dmesg -c", "dmesg -Tc", "dmesg --clear", "nginx -s stop", "nginx -s reload", "nginx",
+            "apachectl restart", "apachectl -k stop", "httpd -k restart", "sshd", "rpm -e nginx", "rpm -ivh x.rpm",
         ] {
             XCTAssertFalse(AICommandPolicy.isSafeForAutoRun(command), "must confirm: \(command)")
         }

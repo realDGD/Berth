@@ -8,13 +8,64 @@ import Foundation
 enum AICommandPolicy {
     /// 任意参数都只读的命令(首个词)
     private static let readOnlyCommands: Set<String> = [
-        "ls", "pwd", "whoami", "id", "hostname", "uname", "uptime", "date", "cal",
+        "ls", "pwd", "whoami", "id", "uname", "uptime", "cal",
         "df", "du", "free", "nproc", "lscpu", "lsblk", "lsmod", "vmstat", "iostat", "mpstat",
-        "ps", "pgrep", "lsof", "netstat", "ss", "ifconfig", "route", "arp",
+        "ps", "pgrep", "lsof", "netstat",
         "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "stat", "file", "readlink", "realpath",
         "which", "type", "echo", "true", "false", "test",
-        "journalctl", "dmesg", "last", "lastlog", "w", "who", "getent",
-        "dpkg-query", "rpm", "nginx", "apachectl", "httpd", "sshd",
+        "last", "lastlog", "w", "who", "getent",
+        "dpkg-query",
+    ]
+
+    /// 本身是诊断命令,但带特定参数就会改系统状态(hostname foo、date -s、route add、
+    /// nginx -s stop、rpm -e …):按原始大小写逐个参数判定,不放行的一律确认
+    private static let argumentRules: [String: ([String]) -> Bool] = [
+        // hostname <name> / -F file / -b 改主机名;只放行 -f/-i/-I/-s/-d 这类读取参数
+        "hostname": { args in args.allSatisfy { $0.hasPrefix("-") && !["-F", "--file", "-b", "--boot"].contains($0) } },
+        // date <MMDDhhmm> / -s / --set 设系统时间(BSD 的 -f 也会);只放行 +格式串 与读取参数
+        "date": { args in
+            args.allSatisfy { ($0.hasPrefix("+") || $0.hasPrefix("-")) && !["-s", "-f"].contains($0) && !$0.hasPrefix("--set") }
+        },
+        // ifconfig eth0 down / ifconfig eth0 10.0.0.2:只放行无参、-a 或单个接口名
+        "ifconfig": { args in args.count <= 1 && !["up", "down"].contains(args.first?.lowercased() ?? "") },
+        // route add/del …:只放行纯参数形式(route -n)
+        "route": { args in args.allSatisfy { $0.hasPrefix("-") } },
+        // arp -d/-s/-f 改 ARP 表
+        "arp": { args in args.allSatisfy { $0.hasPrefix("-") && !["-d", "-s", "-f"].contains($0) } },
+        // ss -K/--kill 杀 socket;短参数可能合写(-tK)
+        "ss": { args in !args.contains { $0 == "--kill" || ($0.hasPrefix("-") && !$0.hasPrefix("--") && $0.contains("K")) } },
+        // journalctl --vacuum-*/--rotate/--flush 删日志、动日志文件
+        "journalctl": { args in
+            let denied = ["--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush",
+                          "--sync", "--relinquish-var", "--smart-relinquish-var", "--setup-keys"]
+            return !args.contains { arg in denied.contains { arg == $0 || arg.hasPrefix($0 + "=") } }
+        },
+        // dmesg -c/-C 清内核缓冲,-n/-D/-E 改控制台级别;短参数可能合写(-Tc)
+        "dmesg": { args in
+            !args.contains { arg in
+                if arg.hasPrefix("--") {
+                    return ["--clear", "--read-clear", "--console-level", "--console-off", "--console-on"]
+                        .contains { arg == $0 || arg.hasPrefix($0 + "=") }
+                }
+                return arg.hasPrefix("-") && arg.contains { "cCnDE".contains($0) }
+            }
+        },
+        // 服务程序只放行配置检查/版本:nginx -s reload、apachectl restart、裸 sshd(起守护进程)都要确认
+        "nginx": { args in !args.isEmpty && args.allSatisfy { ["-t", "-T", "-v", "-V"].contains($0) } },
+        "apachectl": { args in
+            !args.isEmpty && args.allSatisfy { ["configtest", "status", "fullstatus", "-t", "-v", "-V", "-S", "-M", "-l", "-L"].contains($0) }
+        },
+        "httpd": { args in !args.isEmpty && args.allSatisfy { ["-t", "-v", "-V", "-S", "-M", "-l", "-L"].contains($0) } },
+        "sshd": { args in !args.isEmpty && args.allSatisfy { ["-t", "-T"].contains($0) } },
+        // rpm -e 卸载、-i/-U/-F 安装;只放行查询(-q…/--query)与校验(-V/--verify)
+        "rpm": { args in
+            guard let first = args.first,
+                  first.hasPrefix("-q") || first.hasPrefix("--query") || first == "-V" || first == "--verify"
+            else { return false }
+            let denied: Set<String> = ["-e", "--erase", "-i", "--install", "-U", "--upgrade", "-F", "--freshen",
+                                       "--import", "--rebuilddb", "--initdb", "--restore", "--setperms", "--setugids", "--setcaps"]
+            return !args.contains { denied.contains($0) }
+        },
     ]
 
     /// 只放行指定子命令的工具:首个词 → 允许的第二个词
@@ -89,6 +140,9 @@ enum AICommandPolicy {
         words.removeFirst()
         let lowerWords = words.map { $0.lowercased() }
 
+        if let rule = argumentRules[name] {
+            return rule(words)
+        }
         if readOnlyCommands.contains(name) {
             return true
         }
