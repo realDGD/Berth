@@ -258,7 +258,7 @@ final class TerminalSession: Identifiable {
             if shellExited, everConnected {
                 onShellExit?()
             } else {
-                maybeScheduleReconnect(after: disconnectReason)
+                maybeScheduleReconnect(after: disconnectReason, error: caughtError)
             }
         }
     }
@@ -279,8 +279,15 @@ final class TerminalSession: Identifiable {
         isAutoReconnectScheduled = false
     }
 
-    private func maybeScheduleReconnect(after reason: DisconnectReason) {
+    private func maybeScheduleReconnect(after reason: DisconnectReason, error: Error?) {
         guard reason != .userInitiated, everConnected else { return }
+        // 认证失败/主机密钥被拒不是网络抖动:重连只会拿同一份凭据反复撞墙
+        //(每轮最多 4 次密码提交 × 8 轮),足以触发 fail2ban / AD 锁定 / PerSourcePenalties。
+        // 留断线横幅让用户核对凭据后手动「立即重连」。
+        if let error, SessionTerminationClassifier.categorize(error: error) == .authentication {
+            DebugLog.append("auto-reconnect skipped host=\(spec.hostname):\(spec.port) reason=authentication")
+            return
+        }
         // 借用会话不自动重连:否则共享连接因网络抖动断开时,拥有者与所有分屏/复制会话会
         // 同时各自新建 TCP,形成连接风暴,反而触发服务器的频率惩罚。拥有者正常重连(仅 1 条),
         // 借用会话保持断线,由用户手动「立即重连」(此时走自建连接,单条,不成风暴)。

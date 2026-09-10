@@ -137,5 +137,6 @@ enum KeychainStore {
     static func deleteSecrets(for hostID: UUID) {
         try? delete(account: passwordAccount(for: hostID))
         try? delete(account: passphraseAccount(for: hostID))
+        try? delete(account: proxyPasswordAccount(for: hostID))
     }
 }

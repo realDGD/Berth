@@ -74,6 +74,35 @@ final class KnownHostsStoreTests: XCTestCase {
         }
     }
 
+    /// 已知主机出示未记录过的密钥类型:不能当成首次连接,要按变更级别提示并给出已记录指纹
+    func testKnownHostWithNewKeyTypeIsNotUnknown() throws {
+        let directory = NSTemporaryDirectory() + "berth-test-\(UUID().uuidString)"
+        let path = directory + "/known_hosts"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+
+        // 手写一条 RSA 记录(blob 内容不需要是合法密钥,store 只比对类型与 base64)
+        let rsaBlob = Data("fake-rsa-blob".utf8)
+        try "[test.local]:2200 ssh-rsa \(rsaBlob.base64EncodedString())\n"
+            .write(toFile: path, atomically: true, encoding: .utf8)
+        let store = KnownHostsStore(path: path)
+
+        let ed25519 = try NIOSSHPublicKeyFixture.random()
+        guard case .newKeyType(let known) = store.evaluate(hostname: "test.local", port: 2200, presentedKey: ed25519) else {
+            return XCTFail("known host presenting a new key type must not evaluate as .unknown")
+        }
+        XCTAssertEqual(known, [KnownHostsStore.fingerprint(ofBlob: rsaBlob)])
+
+        // 其它主机/端口不受影响,仍是首次连接
+        XCTAssertEqual(store.evaluate(hostname: "test.local", port: 22, presentedKey: ed25519), .unknown)
+        XCTAssertEqual(store.evaluate(hostname: "other.local", port: 2200, presentedKey: ed25519), .unknown)
+
+        // 用户核实并确认后:追加新类型条目,之后该类型 trusted,RSA 记录保留
+        try store.replace(hostname: "test.local", port: 2200, key: ed25519)
+        XCTAssertEqual(store.evaluate(hostname: "test.local", port: 2200, presentedKey: ed25519), .trusted)
+        XCTAssertTrue(try String(contentsOfFile: path, encoding: .utf8).contains("ssh-rsa"))
+    }
+
     func testFingerprintFormat() throws {
         let key = try NIOSSHPublicKeyFixture.random()
         let fingerprint = KnownHostsStore.fingerprint(of: key)

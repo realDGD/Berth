@@ -216,6 +216,12 @@ final class ServerMonitor {
             switch await collectOnce(target) {
             case .collected:
                 failures = 0
+            case .haltUntilRefresh:
+                // 凭据被拒:再试只会累积失败登录直到被封。停掉这台的 runner,
+                // 等用户改主机配置(setTargets 重启)或点刷新(refreshAll)再拨
+                dropOwnedConnection(target.id)
+                runners[target.id] = nil
+                return
             case .failed(let needsHuman):
                 dropOwnedConnection(target.id)
                 failures += 1
@@ -235,6 +241,8 @@ final class ServerMonitor {
         case collected
         /// needsHuman = true 表示重试也没用,得用户去终端里处理一次
         case failed(needsHuman: Bool)
+        /// 服务器拒绝了当前凭据:不再自动重试,直到主机配置变化或用户手动刷新
+        case haltUntilRefresh
     }
 
     private func collectOnce(_ target: Target) async -> CollectOutcome {
@@ -260,6 +268,7 @@ final class ServerMonitor {
                 let status = Self.status(for: error, target: target)
                 states[target.id]?.status = status
                 states[target.id]?.reading = nil
+                if Self.isCredentialRejection(error) { return .haltUntilRefresh }
                 if case .offline = status { return .failed(needsHuman: false) }
                 return .failed(needsHuman: true)
             }
@@ -372,6 +381,9 @@ final class ServerMonitor {
                 return .offline(dialError.errorDescription ?? String(describing: dialError))
             }
         }
+        if isCredentialRejection(error) {
+            return .needsInteraction(String(localized: "认证失败:服务器拒绝了当前密码或密钥。请在终端连接一次核对凭据,或修改主机配置后点刷新;仪表盘不再自动重试,以免触发登录封禁。"))
+        }
         if error is HostKeyError {
             return .needsInteraction(String(localized: "主机密钥未确认。请先在终端连接一次并确认指纹,之后仪表盘才会自动监控。"))
         }
@@ -384,6 +396,14 @@ final class ServerMonitor {
             port: target.spec.port,
             authMethod: target.spec.authMethod
         ))
+    }
+
+    /// 凭据被服务器拒绝(密码/密钥错、交互式认证用尽):与「需要人处理一次」的
+    /// 指纹未确认/MFA 不同,这类失败每重试一次就多一条失败登录记录。
+    private static func isCredentialRejection(_ error: Error) -> Bool {
+        if let kbd = error as? KeyboardInteractiveAuthError, case .exhausted = kbd { return true }
+        if error is HostKeyError || error is KeyboardInteractiveAuthError || error is SSHDialer.DialError { return false }
+        return SessionTerminationClassifier.categorize(error: error) == .authentication
     }
 
     // MARK: - 拨号并发闸门

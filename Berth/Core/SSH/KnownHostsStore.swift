@@ -11,10 +11,14 @@ struct KnownHostsStore {
     enum Evaluation: Equatable {
         /// 主机已知且密钥一致
         case trusted
-        /// 主机从未见过(或没有该类型密钥的记录)
+        /// 主机从未见过
         case unknown
         /// 主机已知但密钥变了 —— 安全关键路径
         case mismatch(knownFingerprints: [String])
+        /// 主机已知,但出示了 known_hosts 里没记录过的密钥类型 —— 同样按变更级别对待:
+        /// 中间人只需在 KEXINIT 里只提供另一种密钥类型,就能绕过同类型比对,不能静默信任。
+        /// knownFingerprints 为该主机已记录的其它类型密钥指纹。
+        case newKeyType(knownFingerprints: [String])
     }
 
     struct Entry {
@@ -38,25 +42,28 @@ struct KnownHostsStore {
         let presentedType = Self.keyType(of: presentedKey)
         let presentedBlob = Self.keyBlobBase64(of: presentedKey)
 
-        var sawHost = false
-        var knownFingerprints: [String] = []
+        var sameTypeFingerprints: [String] = []
+        var otherTypeFingerprints: [String] = []
 
         for entry in entries() where Self.entryMatches(entry, hostToken: hostToken) {
-            sawHost = true
+            if entry.keyType == presentedType, entry.keyBlobBase64 == presentedBlob {
+                return .trusted
+            }
+            guard let data = Data(base64Encoded: entry.keyBlobBase64) else { continue }
+            let fingerprint = Self.fingerprint(ofBlob: data)
             if entry.keyType == presentedType {
-                if entry.keyBlobBase64 == presentedBlob {
-                    return .trusted
-                }
-                if let data = Data(base64Encoded: entry.keyBlobBase64) {
-                    knownFingerprints.append(Self.fingerprint(ofBlob: data))
-                }
+                sameTypeFingerprints.append(fingerprint)
+            } else {
+                otherTypeFingerprints.append(fingerprint)
             }
         }
 
-        if sawHost && !knownFingerprints.isEmpty {
-            return .mismatch(knownFingerprints: knownFingerprints)
+        if !sameTypeFingerprints.isEmpty {
+            return .mismatch(knownFingerprints: sameTypeFingerprints)
         }
-        // 主机有记录但没有该类型的密钥:按未知处理(提示确认后追加)
+        if !otherTypeFingerprints.isEmpty {
+            return .newKeyType(knownFingerprints: otherTypeFingerprints)
+        }
         return .unknown
     }
 

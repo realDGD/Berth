@@ -1,3 +1,4 @@
+#if DEBUG
 import Citadel
 import Crypto
 import Foundation
@@ -64,3 +65,4 @@ enum NIOSSHPublicKeyFixtureRuntime {
         return blob.base64EncodedString()
     }
 }
+#endif

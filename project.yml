@@ -50,6 +50,9 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
         NSHighResolutionCapable: true
+        # Berth 写出的文件(SFTP 下载、拖到 Finder 的副本、本地编辑临时副本)都来自远端,
+        # 打上 com.apple.quarantine 让 Gatekeeper/XProtect 像对待浏览器下载一样把关
+        LSFileQuarantineEnabled: true
         # macOS 15 起,连同网段的地址(192.168.x / 10.x / *.local)要过本地网络隐私门禁。
         # 缺这条说明系统不会给出像样的授权弹窗,连 LAN 主机直接 EHOSTUNREACH。
         # 译文在 Berth/Resources/InfoPlist.xcstrings

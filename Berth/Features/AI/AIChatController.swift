@@ -191,7 +191,8 @@ final class AIChatController {
                 var record: [String: Any] = [
                     "id": call.id,
                     "command": call.command,
-                    "output": call.output,
+                    // 历史文件里不留原始机密;UI 内存里的 call.output 仍是原文
+                    "output": SecretRedactor.redact(call.output),
                     // 进行中/待确认的状态没有意义了,落盘时归到最近的终态
                     "denied": call.status == .denied || call.status == .awaitingApproval,
                 ]
@@ -313,9 +314,10 @@ final class AIChatController {
             return result("Empty command.", isError: true)
         }
 
-        // 自动执行开着也拦危险命令;生产主机一律确认
+        // 自动执行只放行白名单内的只读诊断命令(AICommandPolicy);生产主机一律确认。
+        // 关键词黑名单拦不住提示注入吐出的 curl|sh、写 authorized_keys 之类
         let needsApproval = !AISettings.autoRunCommands
-            || BerthTerminalView.needsConfirmation(command)
+            || !AICommandPolicy.isSafeForAutoRun(command)
             || spec.isProduction
         let call = AIToolCall(id: id, command: command, status: needsApproval ? .awaitingApproval : .running)
         message.toolCalls.append(call)
@@ -341,7 +343,8 @@ final class AIChatController {
         call.exitCode = outcome.exitCode
         call.status = .done
 
-        var text = Self.truncated(outcome.output)
+        // 送给模型(以及随 apiMessages 落盘)的输出先脱敏:私钥、token、口令哈希不出这台 Mac
+        var text = Self.truncated(SecretRedactor.redact(outcome.output))
         if let code = outcome.exitCode {
             text += "\n[exit code: \(code)]"
         }

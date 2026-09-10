@@ -1,3 +1,4 @@
+#if DEBUG
 import AppKit
 import SwiftUI
 
@@ -15,3 +16,4 @@ enum PanelSnapshot {
         try? png.write(to: URL(fileURLWithPath: path))
     }
 }
+#endif

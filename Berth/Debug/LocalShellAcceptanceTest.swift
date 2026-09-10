@@ -1,3 +1,4 @@
+#if DEBUG
 import Foundation
 import SwiftTerm
 
@@ -185,3 +186,4 @@ enum LocalShellAcceptanceTest {
         try? terminal.getBufferAsData(kind: .normal).write(to: URL(fileURLWithPath: path + ".normal"))
     }
 }
+#endif
