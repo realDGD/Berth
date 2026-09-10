@@ -74,6 +74,16 @@
       },
       "shouldTranslate": false
     },
+    "%@:%@ 出示的 %@ 密钥在 known_hosts 中没有记录,已记录的是其它类型的密钥。这可能是服务器新增了密钥类型,也可能是中间人只提供另一种类型来绕过比对。请先向服务器管理员核实下方指纹,再决定是否继续。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The %3$@ key presented by %1$@:%2$@ is not in known_hosts; the keys on record for this host are of other types. The server may have added a key type, or a man-in-the-middle may be offering a different type to bypass comparison. Verify the fingerprint below with the server administrator before continuing."
+          }
+        }
+      }
+    },
     "%@:%@ 返回的主机密钥与 known_hosts 中的记录不一致。这可能意味着中间人攻击,也可能是服务器重装或更换了密钥。请先向服务器管理员核实,再决定是否继续。": {
       "localizations": {
         "en": {
@@ -1721,6 +1731,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Hosts, groups, port forwards, snippets, workspaces and triggers sync automatically through your private iCloud database. Passwords and private keys stay in the local Keychain and are never uploaded. “Sync now” pushes local changes; incoming changes are pulled by the system automatically."
+          }
+        }
+      }
+    },
+    "主机出示了新类型的密钥!": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Host Presented a New Key Type!"
           }
         }
       }
@@ -4056,6 +4076,16 @@
         }
       }
     },
+    "已中止连接:服务器出示了证书形式的主机密钥,Berth 未启用证书认证,无法核验其真实性。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connection aborted: the server presented a certificate-style host key. Berth does not use certificate authentication and cannot verify it."
+          }
+        }
+      }
+    },
     "已保存「%@」": {
       "localizations": {
         "en": {
@@ -4232,6 +4262,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Installed zsh as the default shell and enabled highlighting. This session still runs the old shell; reconnect to take effect."
+          }
+        }
+      }
+    },
+    "已记录的其它类型指纹": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recorded fingerprints (other key types)"
           }
         }
       }
@@ -7293,6 +7333,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Authentication failed: the server did not accept this key. Make sure its public key is in ~/.ssh/authorized_keys for this user on the server, and that the username is correct."
+          }
+        }
+      }
+    },
+    "认证失败:服务器拒绝了当前密码或密钥。请在终端连接一次核对凭据,或修改主机配置后点刷新;仪表盘不再自动重试,以免触发登录封禁。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Authentication failed: the server rejected the current password or key. Connect once in the terminal to verify the credentials, or edit the host and refresh. The dashboard stops retrying to avoid triggering login bans."
           }
         }
       }

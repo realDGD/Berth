@@ -1,3 +1,4 @@
+#if DEBUG
 import Foundation
 import SwiftData
 import SwiftTerm
@@ -111,3 +112,4 @@ enum M1AcceptanceTest {
         try? terminal.getBufferAsData(kind: .alt).write(to: URL(fileURLWithPath: path + ".alt"))
     }
 }
+#endif

@@ -1,3 +1,4 @@
+#if DEBUG
 import AppKit
 import Foundation
 import SwiftData
@@ -184,3 +185,4 @@ enum DashboardAcceptanceTest {
         return true
     }
 }
+#endif

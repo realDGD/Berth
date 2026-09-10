@@ -1,3 +1,4 @@
+#if DEBUG
 import Foundation
 import SwiftData
 import SwiftTerm
@@ -1134,3 +1135,4 @@ enum M2AcceptanceTest {
     }
 }
 
+#endif

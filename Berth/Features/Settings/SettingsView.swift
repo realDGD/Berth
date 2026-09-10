@@ -114,7 +114,9 @@ struct SettingsView: View {
         .navigationTitle("设置")
         .onAppear {
             // issue #15 诊断探针,仅 BERTH_SETTINGS_PROBE 时活动
+            #if DEBUG
             SettingsContextProbe.report(settingsContext: modelContext)
+            #endif
         }
     }
 

@@ -118,6 +118,7 @@ struct SidebarView: View {
                 if let pending = hostPendingDeletion,
                    let host = allHosts.first(where: { $0.id == pending.id }) {
                     KeychainStore.deleteSecrets(for: host.id)
+                    AIChatHistory.deleteAll(hostKey: host.id.uuidString)
                     modelContext.delete(host)
                 }
                 hostPendingDeletion = nil

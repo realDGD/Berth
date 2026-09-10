@@ -911,6 +911,7 @@ struct TerminalPaneView: View {
                 SSHConfigService.shared.removeHostFromConfig(alias: host.label)
             } else {
                 KeychainStore.deleteSecrets(for: host.id)
+                AIChatHistory.deleteAll(hostKey: host.id.uuidString)
                 modelContext.delete(host)
                 // 显式保存,让侧栏 @Query 立即刷新
                 try? modelContext.save()

@@ -327,8 +327,10 @@ final class IOSTerminalSession {
 
     private func settings(for hop: HostSpec) throws -> SSHClientSettings {
         let method = try authenticationMethod(for: hop)
+        // 首次连接必须核对指纹(与 Mac 一致):静默信任等于把 known_hosts 交给第一个应答的人,
+        // 敌对 Wi-Fi 上会把存储的密码直接送给中间人
         let validator = InteractiveHostKeyValidator(
-            hostname: hop.hostname, port: hop.port, autoTrustUnknown: true
+            hostname: hop.hostname, port: hop.port
         ) { [weak self] prompt in
             guard let self else { return false }
             return await self.requestHostKeyDecision(prompt)

@@ -46,7 +46,9 @@ docker rm -f berth-test-sshd   # 停止
 ```
 
 ⚠️ 自动化验收必须用 `open -n <app> --env KEY=VAL …` 启动(直接跑二进制不会触发 SwiftUI `.task`)。
-known_hosts 弹窗在自动化下由测试代码自动信任。
+known_hosts 弹窗在自动化下由测试代码自动信任。验收 harness(`Berth/Debug/`)整体 `#if DEBUG`,
+**只存在于 Debug 构建**;带任何 `BERTH_` 环境变量启动时 defaults 持久域会被快照并在退出时
+恢复(`AcceptanceDefaults`),验收里写的 requireTouchIDForKeys/aiAutoRunCommands 不会留在真机上。
 
 M1 自动化验收(凭据走环境变量,不进 argv;`BERTH_TRANSIENT_STORE=1` 用内存库):
 
@@ -64,6 +66,11 @@ BERTH_M1_AUTOTEST=1 BERTH_TRANSIENT_STORE=1 \
 - 每个里程碑一个 feature branch;提交信息英文,遵循 conventional commits
 - 密码/passphrase 只进 Keychain,任何情况下不落盘明文
 - 快捷键不得占用 Ctrl 组合键(透传给 shell)
+- 安全边界(远端服务器视为敌对):主机密钥首次连接必须核对指纹(Mac/iOS 一致),已知主机换
+  密钥类型按「变更」级警告,证书形式主机密钥一律拒绝;认证失败不自动重连、仪表盘不重试;
+  AI 自动执行只放行 `AICommandPolicy` 白名单里的只读命令,命令输出落盘/送模型前过
+  `SecretRedactor`;远端命名的文件不交给 LaunchServices 默认程序(本地编辑固定用文本编辑器),
+  `LSFileQuarantineEnabled` 已开;终端不回应 OSC 52 读剪贴板,链接只放行 http/https/mailto(+Mac file)
 - 发布形态:Developer ID 签名 + 公证 DMG,不走 App Store(沙盒限制 ~/.ssh 读取)
 - 本地化:zh-Hans 基准 + en,`Berth/Resources/Localizable.xcstrings`。新增 UI 文案后:构建 →
   从 DerivedData 的 `Berth.build/**/*.stringsdata` 汇总 key → 给缺失 key 补 en 翻译(SwiftUI

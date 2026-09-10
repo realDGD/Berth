@@ -31,6 +31,10 @@ struct BerthApp: App {
             MainWindowView()
                 .environment(sessionManager)
                 .task {
+                    #if DEBUG
+                    // 验收 harness 只进 Debug 构建:Release 不该带「环境变量即自动信任主机密钥 /
+                    // dump 终端缓冲 / 截窗口」的入口;跑完恢复 defaults 快照
+                    AcceptanceDefaults.protectIfAutomated()
                     await M1AcceptanceTest.runIfRequested(container: container)
                     await M2AcceptanceTest.runIfRequested(container: container)
                     await M2AcceptanceTest.runReconnectIfRequested(container: container)
@@ -55,6 +59,7 @@ struct BerthApp: App {
                     Task { await WindowSnapshot.runIfRequested() }
                     Task { await SettingsContextProbe.runIfRequested() }
                     await DemoScene.runIfRequested(container: container)
+                    #endif
                     // 自动化验收/临时库环境不做会话恢复,也不发检查更新请求
                     let env = ProcessInfo.processInfo.environment
                     if !env.keys.contains(where: { $0.hasPrefix("BERTH_") }) {
